@@ -1,0 +1,2636 @@
+import { useEffect, useMemo, useState } from "react";
+import {
+  createUserWithEmailAndPassword,
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signOut,
+  type User,
+} from "firebase/auth";
+import {
+  addDoc,
+  collection,
+  doc,
+  getDocs,
+  query,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+  where,
+  type Timestamp,
+} from "firebase/firestore";
+import { httpsCallable } from "firebase/functions";
+import { auth, db, functions } from "./lib/firebase";
+import "./index.css";
+
+type Project = {
+  id: string;
+  projectName: string;
+  businessName: string;
+  businessType: string;
+  status: string;
+  setupStep: string;
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
+};
+
+type AuthMode = "login" | "signup";
+
+const projectStatuses = [
+  "draft",
+  "google_connected",
+  "sheet_connected",
+  "script_project_created",
+  "leads_configured",
+];
+
+const defaultRequiredLeadsFields = [
+  "Lead ID",
+  "Customer Name",
+  "Phone",
+  "Service Type",
+  "Status",
+  "Created At",
+];
+
+const defaultRecommendedLeadsFields = [
+  "Email",
+  "Lead Source",
+  "Assigned To",
+  "Next Follow-Up Date",
+  "Notes",
+  "Updated At",
+  "Created By",
+];
+
+const defaultLeadStatuses = [
+  "New",
+  "Contacted",
+  "Estimate Scheduled",
+  "Estimate Sent",
+  "Won",
+  "Lost",
+];
+
+const defaultMockLeadSheetColumns = [
+  "Lead ID",
+  "Customer Name",
+  "Phone",
+  "Email",
+  "Service Type",
+  "Lead Source",
+  "Status",
+  "Assigned To",
+  "Next Follow-Up Date",
+  "Created At",
+  "Created By",
+  "Updated At",
+  "Notes",
+];
+
+const defaultLeadFieldMappings: Record<string, string> = {
+  "Lead ID": "Lead ID",
+  "Customer Name": "Customer Name",
+  Phone: "Phone",
+  Email: "Email",
+  "Service Type": "Service Type",
+  "Lead Source": "Lead Source",
+  Status: "Status",
+  "Assigned To": "Assigned To",
+  "Next Follow-Up Date": "Next Follow-Up Date",
+  Notes: "Notes",
+  "Created At": "Created At",
+  "Created By": "Created By",
+  "Updated At": "Updated At",
+};
+
+function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  const [mode, setMode] = useState<AuthMode>("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProject, setSelectedProject] = useState<Project | null>(null);
+  const [setupPage, setSetupPage] = useState<
+    | "overview"
+    | "google"
+    | "app-script"
+    | "leads-config"
+    | "field-mapping"
+    | "form-preview"
+    | "ai-plan"
+    | "sync"
+  >("overview");
+  const [loadingProjects, setLoadingProjects] = useState(false);
+
+  const [leadsTabName, setLeadsTabName] = useState("Leads");
+  const [selectedRequiredFields, setSelectedRequiredFields] = useState<string[]>(
+    defaultRequiredLeadsFields
+  );
+  const [selectedRecommendedFields, setSelectedRecommendedFields] =
+    useState<string[]>(defaultRecommendedLeadsFields);
+  const [leadStatusesText, setLeadStatusesText] = useState(
+    defaultLeadStatuses.join("\n")
+  );
+  const [sheetColumnsText, setSheetColumnsText] = useState(
+    defaultMockLeadSheetColumns.join("\n")
+  );
+  const [leadFieldMappings, setLeadFieldMappings] = useState<Record<string, string>>(
+    defaultLeadFieldMappings
+  );
+  const [addLeadPreviewValues, setAddLeadPreviewValues] = useState<Record<string, string>>({
+    "Customer Name": "Jane Smith",
+    Phone: "(903) 555-0142",
+    Email: "jane@example.com",
+    "Service Type": "Roof Repair",
+    "Lead Source": "Website",
+    Status: "New",
+    "Assigned To": "Office",
+    "Next Follow-Up Date": "2026-06-21",
+    Notes: "Customer requested an estimate this week.",
+  });
+  const [aiPlanGenerated, setAiPlanGenerated] = useState(false);
+  const [aiPlanApproved, setAiPlanApproved] = useState(false);
+
+  const [projectName, setProjectName] = useState("");
+  const [businessName, setBusinessName] = useState("");
+  const [businessType, setBusinessType] = useState("Roofing");
+
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+
+  const userInitial = useMemo(() => {
+    return user?.email?.slice(0, 1).toUpperCase() || "U";
+  }, [user]);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+      setAuthReady(true);
+
+      if (currentUser) {
+        await setDoc(
+          doc(db, "users", currentUser.uid),
+          {
+            uid: currentUser.uid,
+            email: currentUser.email,
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        await loadProjects(currentUser.uid);
+      } else {
+        setProjects([]);
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  async function loadProjects(uid: string) {
+    setLoadingProjects(true);
+    setError("");
+
+    try {
+      const membershipQuery = query(
+        collection(db, "projects"),
+        where("memberUserIds", "array-contains", uid)
+      );
+
+      const snapshot = await getDocs(membershipQuery);
+
+      let loadedProjects = snapshot.docs.map((projectDoc) => ({
+        id: projectDoc.id,
+        ...(projectDoc.data() as Omit<Project, "id">),
+      }));
+
+      // Fallback for early projects created before memberUserIds existed.
+      if (loadedProjects.length === 0) {
+        const ownerQuery = query(
+          collection(db, "projects"),
+          where("ownerUserId", "==", uid)
+        );
+
+        const ownerSnapshot = await getDocs(ownerQuery);
+
+        loadedProjects = ownerSnapshot.docs.map((projectDoc) => ({
+          id: projectDoc.id,
+          ...(projectDoc.data() as Omit<Project, "id">),
+        }));
+      }
+
+      loadedProjects.sort((a, b) => {
+        const aTime = a.createdAt?.toMillis?.() || 0;
+        const bTime = b.createdAt?.toMillis?.() || 0;
+        return bTime - aTime;
+      });
+
+      setProjects(loadedProjects);
+      applyOAuthReturnState(loadedProjects);
+    } catch (err) {
+      console.error(err);
+      setError("Could not load projects. Check Firestore permissions.");
+    } finally {
+      setLoadingProjects(false);
+    }
+  }
+
+  async function handleAuthSubmit(event: React.FormEvent) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+
+    try {
+      if (mode === "signup") {
+        const result = await createUserWithEmailAndPassword(auth, email, password);
+
+        await setDoc(doc(db, "users", result.user.uid), {
+          uid: result.user.uid,
+          email: result.user.email,
+          displayName: "",
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+
+        setMessage("Account created. Welcome to UnScriptly.");
+      } else {
+        await signInWithEmailAndPassword(auth, email, password);
+        setMessage("Signed in successfully.");
+      }
+    } catch (err: any) {
+      console.error(err);
+      setError(err?.message || "Authentication failed.");
+    }
+  }
+
+  function applyOAuthReturnState(loadedProjects: Project[]) {
+    const params = new URLSearchParams(window.location.search);
+    const returnedProjectId = params.get("projectId");
+    const returnedSetupPage = params.get("setupPage");
+    const googleConnected = params.get("googleConnected");
+
+    if (!returnedProjectId) {
+      return;
+    }
+
+    const returnedProject = loadedProjects.find(
+      (project) => project.id === returnedProjectId
+    );
+
+    if (!returnedProject) {
+      return;
+    }
+
+    setSelectedProject(returnedProject);
+
+    if (
+      returnedSetupPage === "google" ||
+      returnedSetupPage === "overview" ||
+      returnedSetupPage === "sync"
+    ) {
+      setSetupPage(returnedSetupPage);
+    } else {
+      setSetupPage("google");
+    }
+
+    if (googleConnected === "1") {
+      setMessage("Google connected successfully.");
+    }
+
+    window.history.replaceState({}, document.title, window.location.pathname);
+  }
+
+  async function handleCreateProject(event: React.MouseEvent<HTMLButtonElement>) {
+    event.preventDefault();
+
+    // Legacy mock builders are intentionally retained for fallback/dev mode.
+  // Mark them as referenced so TypeScript allows the real Google sync build.
+  void handleMockConnectGoogle;
+  void handleMockChooseGoogleSheet;
+  void generateAppsScriptFileSet;
+
+  if (!user) {
+      setError("You must be signed in to create a project.");
+      return;
+    }
+
+    setError("");
+    setMessage("");
+
+    const cleanProjectName = projectName.trim();
+    const cleanBusinessName = businessName.trim();
+
+    if (!cleanProjectName || !cleanBusinessName) {
+      setError("Project Name and Business Name are required.");
+      return;
+    }
+
+    try {
+      const newProject = {
+        ownerUserId: user.uid,
+        ownerEmail: user.email || "",
+        createdByUid: user.uid,
+        memberUserIds: [user.uid],
+        projectName: cleanProjectName,
+        businessName: cleanBusinessName,
+        businessType,
+        status: "draft",
+        setupStep: "project_created",
+        spreadsheetId: null,
+        spreadsheetName: null,
+        spreadsheetUrl: null,
+        scriptProjectId: null,
+        scriptProjectName: null,
+        deploymentId: null,
+        webAppUrl: null,
+        adminUrl: null,
+        techUrl: null,
+        sdkVersion: "0.1.0",
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+
+      const createdRef = await addDoc(collection(db, "projects"), newProject);
+
+      const createdProject = {
+        id: createdRef.id,
+        projectName: cleanProjectName,
+        businessName: cleanBusinessName,
+        businessType,
+        status: "draft",
+        setupStep: "project_created",
+      } as Project;
+
+      setProjects((currentProjects) => [createdProject, ...currentProjects]);
+
+      setProjectName("");
+      setBusinessName("");
+      setBusinessType("Roofing");
+      setMessage("Project created successfully.");
+
+      await loadProjects(user.uid);
+    } catch (err: any) {
+      console.error("Create project failed:", err);
+      setError(err?.message || "Could not create project. Check Firestore rules.");
+    }
+  }
+
+  async function handleRealConnectGoogle() {
+    if (!selectedProject) {
+      setError("No project selected.");
+      return;
+    }
+
+    setError("");
+    setMessage("Starting Google connection...");
+
+    try {
+      const startGoogleOAuth = httpsCallable(functions, "startGoogleOAuth");
+      const result: any = await startGoogleOAuth({
+        projectId: selectedProject.id,
+      });
+
+      const url = result.data?.url;
+
+      if (!url) {
+        throw new Error("Google OAuth URL was not returned.");
+      }
+
+      window.location.href = url;
+    } catch (err: any) {
+      console.error("Start Google OAuth failed:", err);
+      setError(err?.message || "Could not start Google connection.");
+    }
+  }
+
+  async function handleMockConnectGoogle() {
+    if (!selectedProject) {
+      setError("No project selected.");
+      return;
+    }
+
+    setError("");
+    setMessage("");
+
+    try {
+      const updatedProject = {
+        ...selectedProject,
+        status: "google_connected",
+        setupStep: "google_connected",
+      };
+
+      await updateDoc(doc(db, "projects", selectedProject.id), {
+        status: "google_connected",
+        setupStep: "google_connected",
+        updatedAt: serverTimestamp(),
+      });
+
+      setSelectedProject(updatedProject);
+
+      setProjects((currentProjects) =>
+        currentProjects.map((project) =>
+          project.id === selectedProject.id ? updatedProject : project
+        )
+      );
+
+      setMessage("Google connection step completed for this project.");
+    } catch (err: any) {
+      console.error("Mock Google connection failed:", err);
+      setError(err?.message || "Could not update project status.");
+    }
+  }
+
+  async function handleRealChooseGoogleSheet() {
+    if (!selectedProject) {
+      setError("Select a project first.");
+      return;
+    }
+
+    setError("");
+    setMessage("Creating Google Sheet for this project...");
+
+    try {
+      const runRealSync = httpsCallable(functions, "runRealSync");
+      await runRealSync({
+        projectId: selectedProject.id,
+      });
+
+      const updatedProject: Project = {
+        ...selectedProject,
+        status: "synced",
+        setupStep: "synced_real",
+      };
+
+      setSelectedProject(updatedProject);
+      setProjects((currentProjects) =>
+        currentProjects.map((project) =>
+          project.id === selectedProject.id ? updatedProject : project
+        )
+      );
+
+      setMessage("Google Sheet created and real sync completed.");
+      setSetupPage("sync");
+    } catch (err) {
+      console.error(err);
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Could not create the Google Sheet. Try reconnecting Google."
+      );
+    }
+  }
+
+  async function handleMockChooseGoogleSheet() {
+    if (!selectedProject) {
+      setError("No project selected.");
+      return;
+    }
+
+    if (selectedProject.status !== "google_connected" && selectedProject.status !== "sheet_connected") {
+      setError("Connect Google before choosing a Google Sheet.");
+      return;
+    }
+
+    setError("");
+    setMessage("");
+
+    try {
+      const updatedProject = {
+        ...selectedProject,
+        status: "sheet_connected",
+        setupStep: "sheet_connected",
+      };
+
+      await updateDoc(doc(db, "projects", selectedProject.id), {
+        status: "sheet_connected",
+        setupStep: "sheet_connected",
+        spreadsheetName: `${selectedProject.businessName} - UnScriptly Operations`,
+        spreadsheetUrl: "Mock Google Sheet URL",
+        updatedAt: serverTimestamp(),
+      });
+
+      setSelectedProject(updatedProject);
+
+      setProjects((currentProjects) =>
+        currentProjects.map((project) =>
+          project.id === selectedProject.id ? updatedProject : project
+        )
+      );
+
+      setMessage("Google Sheet step completed for this project.");
+    } catch (err: any) {
+      console.error("Mock Google Sheet setup failed:", err);
+      setError(err?.message || "Could not update project Sheet status.");
+    }
+  }
+
+  async function handleMockCreateAppsScriptProject() {
+    if (!selectedProject) {
+      setError("No project selected.");
+      return;
+    }
+
+    if (
+      selectedProject.status !== "sheet_connected" &&
+      selectedProject.status !== "script_project_created"
+    ) {
+      setError("Choose a Google Sheet before creating the Apps Script project.");
+      return;
+    }
+
+    setError("");
+    setMessage("");
+
+    try {
+      const updatedProject = {
+        ...selectedProject,
+        status: "script_project_created",
+        setupStep: "script_project_created",
+      };
+
+      await updateDoc(doc(db, "projects", selectedProject.id), {
+        status: "script_project_created",
+        setupStep: "script_project_created",
+        scriptProjectName: `UnScriptly - ${selectedProject.businessName}`,
+        scriptProjectId: "mock-apps-script-project-id",
+        updatedAt: serverTimestamp(),
+      });
+
+      setSelectedProject(updatedProject);
+
+      setProjects((currentProjects) =>
+        currentProjects.map((project) =>
+          project.id === selectedProject.id ? updatedProject : project
+        )
+      );
+
+      setMessage("Apps Script project step completed for this project.");
+    } catch (err: any) {
+      console.error("Mock Apps Script project setup failed:", err);
+      setError(err?.message || "Could not update Apps Script project status.");
+    }
+  }
+
+  async function handleMockEnableLeadsModule() {
+    if (!selectedProject) {
+      setError("No project selected.");
+      return;
+    }
+
+    if (
+      selectedProject.status !== "script_project_created" &&
+      selectedProject.status !== "leads_configured"
+    ) {
+      setError("Create the Apps Script project before enabling Leads.");
+      return;
+    }
+
+    setError("");
+    setMessage("");
+
+    try {
+      const updatedProject = {
+        ...selectedProject,
+        status: "leads_configured",
+        setupStep: "leads_configured",
+      };
+
+      await updateDoc(doc(db, "projects", selectedProject.id), {
+        status: "leads_configured",
+        setupStep: "leads_configured",
+        updatedAt: serverTimestamp(),
+      });
+
+      await setDoc(doc(db, "featureConfigs", `${selectedProject.id}_leads`), {
+        projectId: selectedProject.id,
+        moduleKey: "leads",
+        enabled: true,
+        tabName: "Leads",
+        requiredFields: [
+          "Lead ID",
+          "Customer Name",
+          "Phone",
+          "Service Type",
+          "Status",
+          "Created At",
+        ],
+        recommendedFields: [
+          "Email",
+          "Lead Source",
+          "Assigned To",
+          "Next Follow-Up Date",
+          "Notes",
+        ],
+        statuses: ["New", "Contacted", "Estimate Scheduled", "Won", "Lost"],
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
+
+      setSelectedProject(updatedProject);
+
+      setProjects((currentProjects) =>
+        currentProjects.map((project) =>
+          project.id === selectedProject.id ? updatedProject : project
+        )
+      );
+
+      setMessage("Leads module enabled for this project.");
+    } catch (err: any) {
+      console.error("Enable Leads failed:", err);
+      setError(err?.message || "Could not enable Leads module.");
+    }
+  }
+
+  function toggleRequiredLeadField(fieldName: string) {
+    setSelectedRequiredFields((currentFields) =>
+      currentFields.includes(fieldName)
+        ? currentFields.filter((field) => field !== fieldName)
+        : [...currentFields, fieldName]
+    );
+  }
+
+  function toggleRecommendedLeadField(fieldName: string) {
+    setSelectedRecommendedFields((currentFields) =>
+      currentFields.includes(fieldName)
+        ? currentFields.filter((field) => field !== fieldName)
+        : [...currentFields, fieldName]
+    );
+  }
+
+  async function handleSaveLeadsConfiguration() {
+    if (!selectedProject) {
+      setError("No project selected.");
+      return;
+    }
+
+    if (
+      selectedProject.status !== "script_project_created" &&
+      selectedProject.status !== "leads_configured"
+    ) {
+      setError("Create the Apps Script project before configuring Leads.");
+      return;
+    }
+
+    const cleanTabName = leadsTabName.trim() || "Leads";
+    const statuses = leadStatusesText
+      .split("\n")
+      .map((status) => status.trim())
+      .filter(Boolean);
+
+    if (selectedRequiredFields.length === 0) {
+      setError("Select at least one required Leads field.");
+      return;
+    }
+
+    if (statuses.length === 0) {
+      setError("Add at least one Leads status.");
+      return;
+    }
+
+    setError("");
+    setMessage("");
+
+    try {
+      await setDoc(
+        doc(db, "featureConfigs", `${selectedProject.id}_leads`),
+        {
+          projectId: selectedProject.id,
+          moduleKey: "leads",
+          enabled: true,
+          tabName: cleanTabName,
+          requiredFields: selectedRequiredFields,
+          recommendedFields: selectedRecommendedFields,
+          statuses,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      await updateDoc(doc(db, "projects", selectedProject.id), {
+        status: "leads_configured",
+        setupStep: "leads_configured",
+        updatedAt: serverTimestamp(),
+      });
+
+      const updatedProject = {
+        ...selectedProject,
+        status: "leads_configured",
+        setupStep: "leads_configured",
+      };
+
+      setSelectedProject(updatedProject);
+
+      setProjects((currentProjects) =>
+        currentProjects.map((project) =>
+          project.id === selectedProject.id ? updatedProject : project
+        )
+      );
+
+      setMessage("Leads configuration saved.");
+    } catch (err: any) {
+      console.error("Save Leads configuration failed:", err);
+      setError(err?.message || "Could not save Leads configuration.");
+    }
+  }
+
+  function updateLeadFieldMapping(fieldName: string, columnName: string) {
+    setLeadFieldMappings((currentMappings) => ({
+      ...currentMappings,
+      [fieldName]: columnName,
+    }));
+  }
+
+  async function handleSaveLeadFieldMappings() {
+    if (!selectedProject) {
+      setError("No project selected.");
+      return;
+    }
+
+    if (selectedProject.status !== "leads_configured") {
+      setError("Configure the Leads module before saving field mappings.");
+      return;
+    }
+
+    const sheetColumns = sheetColumnsText
+      .split("\n")
+      .map((column) => column.trim())
+      .filter(Boolean);
+
+    const activeFields = Array.from(
+      new Set([...selectedRequiredFields, ...selectedRecommendedFields])
+    );
+
+    if (sheetColumns.length === 0) {
+      setError("Add at least one Google Sheet column.");
+      return;
+    }
+
+    const missingRequiredMappings = selectedRequiredFields.filter((fieldName) => {
+      const mappedColumn = leadFieldMappings[fieldName];
+      return !mappedColumn;
+    });
+
+    if (missingRequiredMappings.length > 0) {
+      setError(
+        `Map all required fields before saving. Missing: ${missingRequiredMappings.join(", ")}`
+      );
+      return;
+    }
+
+    const missingColumns = activeFields.filter((fieldName) => {
+      const mappedColumn = leadFieldMappings[fieldName];
+      return mappedColumn === "__ADD_NEW_COLUMN__";
+    });
+
+    setError("");
+    setMessage("");
+
+    try {
+      await setDoc(
+        doc(db, "mappings", `${selectedProject.id}_leads`),
+        {
+          projectId: selectedProject.id,
+          moduleKey: "leads",
+          tabName: leadsTabName.trim() || "Leads",
+          sheetColumns,
+          activeFields,
+          requiredFields: selectedRequiredFields,
+          recommendedFields: selectedRecommendedFields,
+          fieldMappings: leadFieldMappings,
+          missingColumns,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      await updateDoc(doc(db, "projects", selectedProject.id), {
+        setupStep: "leads_mapped",
+        updatedAt: serverTimestamp(),
+      });
+
+      const updatedProject = {
+        ...selectedProject,
+        setupStep: "leads_mapped",
+      };
+
+      setSelectedProject(updatedProject);
+
+      setProjects((currentProjects) =>
+        currentProjects.map((project) =>
+          project.id === selectedProject.id ? updatedProject : project
+        )
+      );
+
+      setMessage("Leads field mappings saved.");
+    } catch (err: any) {
+      console.error("Save Leads field mappings failed:", err);
+      setError(err?.message || "Could not save Leads field mappings.");
+    }
+  }
+
+  function updateAddLeadPreviewValue(fieldName: string, value: string) {
+    setAddLeadPreviewValues((currentValues) => ({
+      ...currentValues,
+      [fieldName]: value,
+    }));
+  }
+
+  async function handleSaveAddLeadFormPreview() {
+    if (!selectedProject) {
+      setError("No project selected.");
+      return;
+    }
+
+    if (
+      selectedProject.setupStep !== "leads_mapped" &&
+      selectedProject.setupStep !== "add_lead_form_previewed" &&
+      selectedProject.status !== "leads_configured"
+    ) {
+      setError("Save Leads field mappings before previewing the Add Lead form.");
+      return;
+    }
+
+    const statuses = leadStatusesText
+      .split("\n")
+      .map((status) => status.trim())
+      .filter(Boolean);
+
+    const formFields = Array.from(
+      new Set([...selectedRequiredFields, ...selectedRecommendedFields])
+    ).filter(
+      (fieldName) =>
+        !["Lead ID", "Created At", "Created By", "Updated At"].includes(fieldName)
+    );
+
+    setError("");
+    setMessage("");
+
+    try {
+      await setDoc(
+        doc(db, "formConfigs", `${selectedProject.id}_leads_add`),
+        {
+          projectId: selectedProject.id,
+          moduleKey: "leads",
+          formKey: "add_lead",
+          formName: "Add Lead",
+          formType: "create",
+          targetTabName: leadsTabName.trim() || "Leads",
+          fields: formFields.map((fieldName) => ({
+            fieldName,
+            mappedColumn: leadFieldMappings[fieldName] || "",
+            required: selectedRequiredFields.includes(fieldName),
+            inputType:
+              fieldName === "Status"
+                ? "select"
+                : fieldName === "Notes"
+                  ? "textarea"
+                  : fieldName.toLowerCase().includes("date")
+                    ? "date"
+                    : "text",
+            options: fieldName === "Status" ? statuses : [],
+          })),
+          previewValues: addLeadPreviewValues,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      await updateDoc(doc(db, "projects", selectedProject.id), {
+        setupStep: "add_lead_form_previewed",
+        updatedAt: serverTimestamp(),
+      });
+
+      const updatedProject = {
+        ...selectedProject,
+        setupStep: "add_lead_form_previewed",
+      };
+
+      setSelectedProject(updatedProject);
+
+      setProjects((currentProjects) =>
+        currentProjects.map((project) =>
+          project.id === selectedProject.id ? updatedProject : project
+        )
+      );
+
+      setMessage("Add Lead form preview saved.");
+    } catch (err: any) {
+      console.error("Save Add Lead form preview failed:", err);
+      setError(err?.message || "Could not save Add Lead form preview.");
+    }
+  }
+
+  function getAiImplementationPlanPreview() {
+    const statuses = leadStatusesText
+      .split("\n")
+      .map((status) => status.trim())
+      .filter(Boolean);
+
+    const activeFields = Array.from(
+      new Set([...selectedRequiredFields, ...selectedRecommendedFields])
+    );
+
+    const formFields = activeFields.filter(
+      (fieldName) =>
+        !["Lead ID", "Created At", "Created By", "Updated At"].includes(fieldName)
+    );
+
+    return {
+      summary:
+        "Generate a private Apps Script dashboard connected to the selected Google Sheet with Leads module support, an Add Lead form, field mappings, status handling, and basic admin runtime actions.",
+      sheetChanges: [
+        `Confirm or create tab: ${leadsTabName.trim() || "Leads"}`,
+        `Confirm required columns: ${selectedRequiredFields.join(", ")}`,
+        `Confirm recommended columns: ${selectedRecommendedFields.join(", ")}`,
+        `Use statuses: ${statuses.join(", ")}`,
+        "Preserve existing rows, formulas, and manually entered data",
+      ],
+      appsScriptFiles: [
+        "appsscript.json",
+        "Code.gs",
+        "Routes.gs",
+        "ClientConfig.gs",
+        "RuntimeAuth.gs",
+        "RuntimeData.gs",
+        "RuntimeActions.gs",
+        "RuntimeForms.gs",
+        "Admin.html",
+        "Login.html",
+        "Styles.html",
+        "Scripts.html",
+        "Components.html",
+        "Forms.html",
+      ],
+      forms: [
+        {
+          name: "Add Lead",
+          type: "create",
+          targetTab: leadsTabName.trim() || "Leads",
+          fields: formFields,
+        },
+      ],
+      runtimeActions: [
+        "Load Leads records from Google Sheets",
+        "Create a new Lead record",
+        "Generate Lead ID if missing",
+        "Validate required Lead fields before save",
+        "Write audit log entry for created Leads",
+        "Render admin dashboard Leads table",
+      ],
+      safetyChecks: [
+        "Do not delete existing Sheet tabs",
+        "Do not delete existing columns",
+        "Do not rename existing columns without approval",
+        "Do not overwrite existing operational records",
+        "Require user approval before Sync",
+        "Generate a full Apps Script file set before updateContent",
+      ],
+      warnings: [
+        "Google OAuth, real Sheet detection, and real Apps Script generation are not connected yet.",
+        "This plan is currently a preview generated from local project configuration.",
+      ],
+      blockers: [],
+    };
+  }
+
+  async function handleGenerateAiImplementationPlan() {
+    if (!selectedProject) {
+      setError("No project selected.");
+      return;
+    }
+
+    if (
+      selectedProject.setupStep !== "add_lead_form_previewed" &&
+      selectedProject.setupStep !== "ai_plan_ready" &&
+      selectedProject.setupStep !== "sync_ready"
+    ) {
+      setError("Save the Add Lead form preview before generating the AI plan.");
+      return;
+    }
+
+    setError("");
+    setMessage("");
+
+    const plan = getAiImplementationPlanPreview();
+
+    try {
+      await setDoc(
+        doc(db, "aiImplementationPlans", `${selectedProject.id}_latest`),
+        {
+          projectId: selectedProject.id,
+          planType: "mock_ai_implementation_plan",
+          approved: false,
+          status: "ready_for_review",
+          summary: plan.summary,
+          sheetChanges: plan.sheetChanges,
+          appsScriptFiles: plan.appsScriptFiles,
+          forms: plan.forms,
+          runtimeActions: plan.runtimeActions,
+          safetyChecks: plan.safetyChecks,
+          warnings: plan.warnings,
+          blockers: plan.blockers,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      await updateDoc(doc(db, "projects", selectedProject.id), {
+        setupStep: "ai_plan_ready",
+        updatedAt: serverTimestamp(),
+      });
+
+      const updatedProject = {
+        ...selectedProject,
+        setupStep: "ai_plan_ready",
+      };
+
+      setSelectedProject(updatedProject);
+      setAiPlanGenerated(true);
+      setAiPlanApproved(false);
+
+      setProjects((currentProjects) =>
+        currentProjects.map((project) =>
+          project.id === selectedProject.id ? updatedProject : project
+        )
+      );
+
+      setMessage("AI Implementation Plan generated for review.");
+    } catch (err: any) {
+      console.error("Generate AI plan failed:", err);
+      setError(err?.message || "Could not generate AI Implementation Plan.");
+    }
+  }
+
+  async function handleApproveAiImplementationPlan() {
+    if (!selectedProject) {
+      setError("No project selected.");
+      return;
+    }
+
+    if (!aiPlanGenerated && selectedProject.setupStep !== "ai_plan_ready") {
+      setError("Generate the AI Implementation Plan before approving it.");
+      return;
+    }
+
+    setError("");
+    setMessage("");
+
+    try {
+      await setDoc(
+        doc(db, "aiImplementationPlans", `${selectedProject.id}_latest`),
+        {
+          projectId: selectedProject.id,
+          approved: true,
+          status: "approved_for_sync",
+          approvedAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      await updateDoc(doc(db, "projects", selectedProject.id), {
+        setupStep: "sync_ready",
+        updatedAt: serverTimestamp(),
+      });
+
+      const updatedProject = {
+        ...selectedProject,
+        setupStep: "sync_ready",
+      };
+
+      setSelectedProject(updatedProject);
+      setAiPlanApproved(true);
+
+      setProjects((currentProjects) =>
+        currentProjects.map((project) =>
+          project.id === selectedProject.id ? updatedProject : project
+        )
+      );
+
+      setMessage("AI Implementation Plan approved. Project is ready for Sync.");
+    } catch (err: any) {
+      console.error("Approve AI plan failed:", err);
+      setError(err?.message || "Could not approve AI Implementation Plan.");
+    }
+  }
+
+  function getSyncCenterPreview() {
+    const isPlanApproved =
+      selectedProject?.setupStep === "sync_ready" ||
+      selectedProject?.setupStep === "pre_sync_reviewed" ||
+      selectedProject?.setupStep === "synced_mock" ||
+      selectedProject?.status === "synced";
+
+    return {
+      isPlanApproved,
+      readinessItems: [
+        {
+          label: "Google connected",
+          ready:
+            selectedProject?.status === "google_connected" ||
+            selectedProject?.status === "sheet_connected" ||
+            selectedProject?.status === "script_project_created" ||
+            selectedProject?.status === "leads_configured",
+        },
+        {
+          label: "Google Sheet selected",
+          ready:
+            selectedProject?.status === "sheet_connected" ||
+            selectedProject?.status === "script_project_created" ||
+            selectedProject?.status === "leads_configured",
+        },
+        {
+          label: "Apps Script project created",
+          ready:
+            selectedProject?.status === "script_project_created" ||
+            selectedProject?.status === "leads_configured",
+        },
+        {
+          label: "Leads configured",
+          ready: selectedProject?.status === "leads_configured",
+        },
+        {
+          label: "AI plan approved",
+          ready: isPlanApproved,
+        },
+      ],
+      sheetChanges: [
+        `Confirm tab: ${leadsTabName.trim() || "Leads"}`,
+        "Confirm required Leads columns exist",
+        "Add missing approved columns to the right side only",
+        "Preserve all existing rows and formulas",
+        "Write sync log entry after successful sync",
+      ],
+      scriptChanges: [
+        "Generate full Apps Script file set",
+        "Generate admin dashboard shell",
+        "Generate Leads table runtime",
+        "Generate Add Lead form runtime",
+        "Generate runtime validation helpers",
+        "Generate audit log helpers",
+      ],
+      safetyRules: [
+        "No Sheet data will be deleted",
+        "No columns will be renamed automatically",
+        "No tabs will be removed",
+        "No Apps Script deployment will be updated without a separate Deploy step",
+        "Full file generation is required before Apps Script updateContent",
+        "User approval is required before real Sync",
+      ],
+      blockedReasons: isPlanApproved
+        ? []
+        : ["AI Implementation Plan must be approved before Sync can run."],
+    };
+  }
+
+  async function handleSaveSyncCenterPreview() {
+    if (!selectedProject) {
+      setError("No project selected.");
+      return;
+    }
+
+    const preview = getSyncCenterPreview();
+
+    if (!preview.isPlanApproved) {
+      setError("Approve the AI Implementation Plan before completing pre-sync review.");
+      return;
+    }
+
+    setError("");
+    setMessage("");
+
+    try {
+      await setDoc(
+        doc(db, "syncRuns", `${selectedProject.id}_preview`),
+        {
+          projectId: selectedProject.id,
+          runType: "pre_sync_preview",
+          status: "reviewed",
+          syncAllowed: true,
+          readinessItems: preview.readinessItems,
+          sheetChanges: preview.sheetChanges,
+          scriptChanges: preview.scriptChanges,
+          safetyRules: preview.safetyRules,
+          blockedReasons: preview.blockedReasons,
+          reviewedAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      await updateDoc(doc(db, "projects", selectedProject.id), {
+        setupStep: "pre_sync_reviewed",
+        updatedAt: serverTimestamp(),
+      });
+
+      const updatedProject = {
+        ...selectedProject,
+        setupStep: "pre_sync_reviewed",
+      };
+
+      setSelectedProject(updatedProject);
+
+      setProjects((currentProjects) =>
+        currentProjects.map((project) =>
+          project.id === selectedProject.id ? updatedProject : project
+        )
+      );
+
+      setMessage("Pre-sync review saved. This project is ready for the real Sync build.");
+    } catch (err: any) {
+      console.error("Save Sync Center preview failed:", err);
+      setError(err?.message || "Could not save Sync Center preview.");
+    }
+  }
+
+  function generateAppsScriptFileSet() {
+    const tabName = leadsTabName.trim() || "Leads";
+
+    return [
+      {
+        name: "appsscript.json",
+        type: "json",
+        source: JSON.stringify(
+          {
+            timeZone: "America/Chicago",
+            dependencies: {},
+            exceptionLogging: "STACKDRIVER",
+            runtimeVersion: "V8",
+            webapp: {
+              executeAs: "USER_DEPLOYING",
+              access: "ANYONE_ANONYMOUS",
+            },
+          },
+          null,
+          2
+        ),
+      },
+      {
+        name: "Code.gs",
+        type: "server_js",
+        source: `function doGet(e) {
+  return HtmlService.createTemplateFromFile('Admin')
+    .evaluate()
+    .setTitle('UnScriptly Dashboard')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}`,
+      },
+      {
+        name: "Routes.gs",
+        type: "server_js",
+        source: `var UNS_ROUTES = {
+  admin: 'Admin',
+  login: 'Login'
+};`,
+      },
+      {
+        name: "ClientConfig.gs",
+        type: "server_js",
+        source: `var UNS_CONFIG = {
+  appName: 'UnScriptly Dashboard',
+  leadsTabName: '${tabName}',
+  moduleKeys: ['leads'],
+  generatedAt: new Date().toISOString()
+};`,
+      },
+      {
+        name: "RuntimeAuth.gs",
+        type: "server_js",
+        source: `function getCurrentUser_() {
+  return {
+    email: Session.getActiveUser().getEmail(),
+    role: 'admin'
+  };
+}`,
+      },
+      {
+        name: "RuntimeData.gs",
+        type: "server_js",
+        source: `function getSheet_() {
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
+
+function getTab_(tabName) {
+  var sheet = getSheet_().getSheetByName(tabName);
+  if (!sheet) {
+    throw new Error('Missing tab: ' + tabName);
+  }
+  return sheet;
+}
+
+function getHeaders_(sheet) {
+  return sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+}`,
+      },
+      {
+        name: "RuntimeActions.gs",
+        type: "server_js",
+        source: `function createLead(payload) {
+  var sheet = getTab_(UNS_CONFIG.leadsTabName);
+  var headers = getHeaders_(sheet);
+
+  var row = headers.map(function(header) {
+    if (header === 'Lead ID') return 'LEAD-' + new Date().getTime();
+    if (header === 'Created At') return new Date();
+    if (header === 'Updated At') return new Date();
+    return payload[header] || '';
+  });
+
+  sheet.appendRow(row);
+  return { ok: true };
+}`,
+      },
+      {
+        name: "RuntimeForms.gs",
+        type: "server_js",
+        source: `function getAddLeadFormConfig() {
+  return {
+    formKey: 'add_lead',
+    title: 'Add Lead',
+    targetTabName: UNS_CONFIG.leadsTabName
+  };
+}`,
+      },
+      {
+        name: "Admin.html",
+        type: "html",
+        source: `<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <?!= include('Styles'); ?>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="hero">
+        <p class="eyebrow">UnScriptly</p>
+        <h1>Leads Dashboard</h1>
+        <p>Generated Apps Script dashboard preview.</p>
+      </section>
+
+      <?!= include('Forms'); ?>
+    </main>
+
+    <?!= include('Scripts'); ?>
+  </body>
+</html>`,
+      },
+      {
+        name: "Login.html",
+        type: "html",
+        source: `<section class="login-card">
+  <h1>Login</h1>
+  <p>Runtime auth placeholder.</p>
+</section>`,
+      },
+      {
+        name: "Styles.html",
+        type: "html",
+        source: `<style>
+  body {
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #f8fafc;
+    color: #111827;
+  }
+
+  .app-shell {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 32px;
+  }
+
+  .hero,
+  .form-card {
+    border: 1px solid #e5e7eb;
+    border-radius: 20px;
+    padding: 24px;
+    background: #ffffff;
+    margin-bottom: 20px;
+  }
+
+  .eyebrow {
+    color: #2563eb;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-size: 12px;
+    font-weight: 800;
+  }
+
+  label {
+    display: grid;
+    gap: 6px;
+    margin-bottom: 12px;
+    font-weight: 700;
+  }
+
+  input,
+  select,
+  textarea {
+    border: 1px solid #d1d5db;
+    border-radius: 10px;
+    padding: 10px;
+  }
+
+  button {
+    border: 0;
+    border-radius: 10px;
+    padding: 11px 14px;
+    color: white;
+    background: #111827;
+    font-weight: 800;
+  }
+</style>`,
+      },
+      {
+        name: "Scripts.html",
+        type: "html",
+        source: `<script>
+  function submitLeadPreview() {
+    alert('This generated dashboard is ready for runtime wiring.');
+  }
+</script>`,
+      },
+      {
+        name: "Components.html",
+        type: "html",
+        source: `<template id="empty-state">
+  <p>No records yet.</p>
+</template>`,
+      },
+      {
+        name: "Forms.html",
+        type: "html",
+        source: `<section class="form-card">
+  <h2>Add Lead</h2>
+  <form onsubmit="submitLeadPreview(); return false;">
+    <label>
+      Customer Name
+      <input name="Customer Name" required>
+    </label>
+
+    <label>
+      Phone
+      <input name="Phone" required>
+    </label>
+
+    <label>
+      Service Type
+      <input name="Service Type" required>
+    </label>
+
+    <label>
+      Status
+      <select name="Status" required>
+        ${leadStatusesText
+          .split("\\n")
+          .map((status) => status.trim())
+          .filter(Boolean)
+          .map((status) => `<option>${status}</option>`)
+          .join("\\n        ")}
+      </select>
+    </label>
+
+    <label>
+      Notes
+      <textarea name="Notes"></textarea>
+    </label>
+
+    <button type="submit">Submit Lead</button>
+  </form>
+</section>`,
+      },
+    ];
+  }
+
+  async function handleRunSyncMvp() {
+    if (!selectedProject) {
+      setError("No project selected.");
+      return;
+    }
+
+    setError("");
+    setMessage("Running real Google Sync...");
+
+    try {
+      const runRealSync = httpsCallable(functions, "runRealSync");
+      const result: any = await runRealSync({
+        projectId: selectedProject.id,
+      });
+
+      const data = result.data;
+
+      const updatedProject = {
+        ...selectedProject,
+        status: "synced",
+        setupStep: "synced_real",
+      };
+
+      setSelectedProject(updatedProject);
+
+      setProjects((currentProjects) =>
+        currentProjects.map((project) =>
+          project.id === selectedProject.id ? updatedProject : project
+        )
+      );
+
+      setMessage(
+        `Real Sync completed. Sheet and Apps Script were updated. Sync Run: ${data.syncRunId}`
+      );
+    } catch (err: any) {
+      console.error("Real Sync failed:", err);
+      setError(err?.message || "Could not run real Google Sync.");
+    }
+  }
+
+  async function handleLogout() {
+    await signOut(auth);
+    setMessage("");
+    setError("");
+  }
+
+  if (!authReady) {
+    return (
+      <main className="page-center">
+        <div className="loading-card">Loading UnScriptly...</div>
+      </main>
+    );
+  }
+
+  // Legacy mock builders are intentionally retained for fallback/dev mode.
+  // Mark them as referenced so TypeScript allows the real Google sync build.
+  void handleMockConnectGoogle;
+  void handleMockChooseGoogleSheet;
+  void generateAppsScriptFileSet;
+
+  if (!user) {
+    return (
+      <main className="auth-page">
+        <section className="auth-hero">
+          <div className="brand-mark">U</div>
+          <p className="eyebrow">UnScriptly</p>
+          <h1>Turn your Google Sheet into a private dashboard.</h1>
+          <p className="hero-copy">
+            Connect your Sheet, choose your features, preview your setup, and
+            prepare your Apps Script dashboard without touching code.
+          </p>
+
+          <div className="hero-checklist">
+            <span>Google Sheets-powered</span>
+            <span>Apps Script-ready</span>
+            <span>Built for home service teams</span>
+          </div>
+        </section>
+
+        <section className="auth-card">
+          <div className="auth-tabs">
+            <button
+              className={mode === "login" ? "active" : ""}
+              onClick={() => setMode("login")}
+              type="button"
+            >
+              Login
+            </button>
+            <button
+              className={mode === "signup" ? "active" : ""}
+              onClick={() => setMode("signup")}
+              type="button"
+            >
+              Sign up
+            </button>
+          </div>
+
+          <h2>{mode === "login" ? "Welcome back" : "Create your account"}</h2>
+          <p className="muted">
+            {mode === "login"
+              ? "Sign in to manage your UnScriptly projects."
+              : "Start building your first Google Sheets-powered dashboard."}
+          </p>
+
+          <form onSubmit={handleAuthSubmit} className="form-stack">
+            <label>
+              Email
+              <input
+                type="email"
+                placeholder="owner@company.com"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                required
+              />
+            </label>
+
+            <label>
+              Password
+              <input
+                type="password"
+                placeholder="Minimum 6 characters"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                required
+                minLength={6}
+              />
+            </label>
+
+            {error && <div className="error-box">{error}</div>}
+            {message && <div className="success-box">{message}</div>}
+
+            <button className="primary-button" type="submit">
+              {mode === "login" ? "Login" : "Create account"}
+            </button>
+          </form>
+        </section>
+      </main>
+    );
+  }
+
+  if (selectedProject) {
+    return (
+      <main className="dashboard-shell">
+        <aside className="sidebar">
+          <div className="sidebar-brand">
+            <div className="brand-mark small">U</div>
+            <div>
+              <strong>UnScriptly</strong>
+              <span>Control Center</span>
+            </div>
+          </div>
+
+          <nav>
+            <a onClick={() => setSelectedProject(null)}>Dashboard</a>
+            <a
+              className={setupPage === "overview" ? "active" : ""}
+              onClick={() => setSetupPage("overview")}
+            >
+              Overview
+            </a>
+            <a
+              className={setupPage === "google" ? "active" : ""}
+              onClick={() => setSetupPage("google")}
+            >
+              Google + Sheet
+            </a>
+            <a
+              className={setupPage === "app-script" ? "active" : ""}
+              onClick={() => setSetupPage("app-script")}
+            >
+              Apps Script
+            </a>
+            <a
+              className={setupPage === "leads-config" ? "active" : ""}
+              onClick={() => setSetupPage("leads-config")}
+            >
+              Leads Config
+            </a>
+            <a
+              className={setupPage === "field-mapping" ? "active" : ""}
+              onClick={() => setSetupPage("field-mapping")}
+            >
+              Field Mapping
+            </a>
+            <a
+              className={setupPage === "form-preview" ? "active" : ""}
+              onClick={() => setSetupPage("form-preview")}
+            >
+              Form Preview
+            </a>
+            <a
+              className={setupPage === "ai-plan" ? "active" : ""}
+              onClick={() => setSetupPage("ai-plan")}
+            >
+              AI Plan
+            </a>
+            <a
+              className={setupPage === "sync" ? "active" : ""}
+              onClick={() => setSetupPage("sync")}
+            >
+              Sync
+            </a>
+          </nav>
+        </aside>
+
+        <section className="dashboard-main">
+          <header className="dashboard-header">
+            <div>
+              <p className="eyebrow">Project Setup</p>
+              <h1>{selectedProject.projectName}</h1>
+              <p className="muted">
+                {selectedProject.businessName} · {selectedProject.businessType}
+              </p>
+            </div>
+
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => setSelectedProject(null)}
+            >
+              Back to Dashboard
+            </button>
+          </header>
+
+          <section className="setup-stepper panel">
+            <button
+              className={setupPage === "overview" ? "step-tab active" : "step-tab"}
+              type="button"
+              onClick={() => setSetupPage("overview")}
+            >
+              Overview
+            </button>
+            <button
+              className={setupPage === "google" ? "step-tab active" : "step-tab"}
+              type="button"
+              onClick={() => setSetupPage("google")}
+            >
+              Google + Sheet
+            </button>
+            <button
+              className={setupPage === "app-script" ? "step-tab active" : "step-tab"}
+              type="button"
+              onClick={() => setSetupPage("app-script")}
+            >
+              Apps Script
+            </button>
+            <button
+              className={setupPage === "leads-config" ? "step-tab active" : "step-tab"}
+              type="button"
+              onClick={() => setSetupPage("leads-config")}
+            >
+              Leads Config
+            </button>
+            <button
+              className={setupPage === "field-mapping" ? "step-tab active" : "step-tab"}
+              type="button"
+              onClick={() => setSetupPage("field-mapping")}
+            >
+              Field Mapping
+            </button>
+            <button
+              className={setupPage === "form-preview" ? "step-tab active" : "step-tab"}
+              type="button"
+              onClick={() => setSetupPage("form-preview")}
+            >
+              Form Preview
+            </button>
+            <button
+              className={setupPage === "ai-plan" ? "step-tab active" : "step-tab"}
+              type="button"
+              onClick={() => setSetupPage("ai-plan")}
+            >
+              AI Plan
+            </button>
+            <button
+              className={setupPage === "sync" ? "step-tab active" : "step-tab"}
+              type="button"
+              onClick={() => setSetupPage("sync")}
+            >
+              Sync
+            </button>
+          </section>
+
+          <section className={setupPage === "overview" ? "grid-layout" : "hidden-section"}>
+            <div className="panel">
+              <h2>Current Status</h2>
+              <p className="muted">
+                This project has been created and is ready for the next setup step.
+              </p>
+
+              <div className="setup-list">
+                <div className="setup-step done">Project Created</div>
+                <div className="setup-step">Connect Google</div>
+                <div className="setup-step">Choose Google Sheet</div>
+                <div className="setup-step">Create Apps Script Project</div>
+                <div className="setup-step">Enable Leads Module</div>
+                <div className="setup-step locked">Generate Forms</div>
+                <div className="setup-step locked">AI Implementation Plan</div>
+                <div className="setup-step locked">Sync</div>
+                <div className="setup-step locked">Deploy</div>
+              </div>
+            </div>
+
+            <div className="panel">
+              <h2>Next Step</h2>
+              <p className="muted">
+                Connect this project to Google so UnScriptly can create or detect
+                the client-owned Google Sheet and prepare the Apps Script project.
+              </p>
+
+              <button
+                className="primary-button"
+                type="button"
+                onClick={handleRealConnectGoogle}
+              >
+                Connect Google
+              </button>
+
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={handleRealChooseGoogleSheet}
+                style={{ marginTop: 12 }}
+              >
+                Choose Google Sheet
+              </button>
+
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={handleMockCreateAppsScriptProject}
+                style={{ marginTop: 12 }}
+              >
+                Create Apps Script Project
+              </button>
+
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={handleMockEnableLeadsModule}
+                style={{ marginTop: 12 }}
+              >
+                Enable Leads Module
+              </button>
+
+              {message && <div className="success-box" style={{ marginTop: 16 }}>{message}</div>}
+              {error && <div className="error-box" style={{ marginTop: 16 }}>{error}</div>}
+
+              <p className="muted" style={{ marginTop: 16 }}>
+                These are currently safe mock setup steps. The next major build will replace
+                them with real Google OAuth and Google Sheets API actions.
+              </p>
+            </div>
+          </section>
+
+          <section className={setupPage === "leads-config" ? "panel" : "hidden-section"}>
+            <h2>Leads Configuration</h2>
+            <p className="muted">
+              Configure how UnScriptly should structure the Leads module before
+              generating forms, Sheets columns, and dashboard views.
+            </p>
+
+            <div className="form-stack">
+              <label>
+                Leads Tab Name
+                <input
+                  type="text"
+                  value={leadsTabName}
+                  onChange={(event) => setLeadsTabName(event.target.value)}
+                  placeholder="Leads"
+                />
+              </label>
+
+              <div>
+                <h3>Required Fields</h3>
+                <p className="muted">
+                  These fields are needed for the Leads module to work correctly.
+                </p>
+
+                <div className="field-grid">
+                  {defaultRequiredLeadsFields.map((fieldName) => (
+                    <label className="field-check" key={fieldName}>
+                      <input
+                        type="checkbox"
+                        checked={selectedRequiredFields.includes(fieldName)}
+                        onChange={() => toggleRequiredLeadField(fieldName)}
+                      />
+                      <span>{fieldName}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <h3>Recommended Fields</h3>
+                <p className="muted">
+                  These fields make the dashboard more useful but can be adjusted.
+                </p>
+
+                <div className="field-grid">
+                  {defaultRecommendedLeadsFields.map((fieldName) => (
+                    <label className="field-check" key={fieldName}>
+                      <input
+                        type="checkbox"
+                        checked={selectedRecommendedFields.includes(fieldName)}
+                        onChange={() => toggleRecommendedLeadField(fieldName)}
+                      />
+                      <span>{fieldName}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <label>
+                Lead Statuses
+                <textarea
+                  value={leadStatusesText}
+                  onChange={(event) => setLeadStatusesText(event.target.value)}
+                  rows={7}
+                  placeholder={"New\nContacted\nEstimate Scheduled\nWon\nLost"}
+                />
+              </label>
+
+              <button
+                className="primary-button"
+                type="button"
+                onClick={handleSaveLeadsConfiguration}
+              >
+                Save Leads Configuration
+              </button>
+            </div>
+          </section>
+
+          <section className={setupPage === "field-mapping" ? "panel" : "hidden-section"}>
+            <h2>Leads Field Mapping</h2>
+            <p className="muted">
+              Map each UnScriptly Leads field to the Google Sheet column it should read from or write to.
+              For now, these are mock Sheet columns. Later, UnScriptly will detect them from the connected Sheet.
+            </p>
+
+            <div className="form-stack">
+              <label>
+                Detected Google Sheet Columns
+                <textarea
+                  value={sheetColumnsText}
+                  onChange={(event) => setSheetColumnsText(event.target.value)}
+                  rows={8}
+                  placeholder={"Lead ID\nCustomer Name\nPhone\nEmail\nStatus"}
+                />
+              </label>
+
+              <div>
+                <h3>Field Mapping</h3>
+                <p className="muted">
+                  Required fields must be mapped. Recommended fields can be mapped, skipped, or marked as new columns to add later.
+                </p>
+
+                <div className="mapping-list">
+                  {Array.from(
+                    new Set([...selectedRequiredFields, ...selectedRecommendedFields])
+                  ).map((fieldName) => {
+                    const sheetColumns = sheetColumnsText
+                      .split("\n")
+                      .map((column) => column.trim())
+                      .filter(Boolean);
+
+                    const isRequired = selectedRequiredFields.includes(fieldName);
+
+                    return (
+                      <div className="mapping-row" key={fieldName}>
+                        <div>
+                          <strong>{fieldName}</strong>
+                          <span>{isRequired ? "Required" : "Recommended"}</span>
+                        </div>
+
+                        <select
+                          value={leadFieldMappings[fieldName] || ""}
+                          onChange={(event) =>
+                            updateLeadFieldMapping(fieldName, event.target.value)
+                          }
+                        >
+                          <option value="">Do not map yet</option>
+                          {sheetColumns.map((columnName) => (
+                            <option value={columnName} key={columnName}>
+                              {columnName}
+                            </option>
+                          ))}
+                          <option value="__ADD_NEW_COLUMN__">
+                            Add as new column later
+                          </option>
+                        </select>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <button
+                className="primary-button"
+                type="button"
+                onClick={handleSaveLeadFieldMappings}
+              >
+                Save Field Mappings
+              </button>
+            </div>
+          </section>
+
+          <section className={setupPage === "form-preview" ? "panel" : "hidden-section"}>
+            <h2>Generated Add Lead Form Preview</h2>
+            <p className="muted">
+              This preview shows the Add Lead form UnScriptly will generate inside the Apps Script dashboard.
+              Fields come from your Leads configuration and field mappings.
+            </p>
+
+            <div className="generated-form-preview">
+              <div className="generated-form-header">
+                <div>
+                  <p className="eyebrow">Preview Form</p>
+                  <h3>Add Lead</h3>
+                  <p className="muted">
+                    Target tab: {leadsTabName.trim() || "Leads"}
+                  </p>
+                </div>
+
+                <span className="status-badge">Internal Form</span>
+              </div>
+
+              <div className="form-stack">
+                {Array.from(
+                  new Set([...selectedRequiredFields, ...selectedRecommendedFields])
+                )
+                  .filter(
+                    (fieldName) =>
+                      !["Lead ID", "Created At", "Created By", "Updated At"].includes(
+                        fieldName
+                      )
+                  )
+                  .map((fieldName) => {
+                    const isRequired = selectedRequiredFields.includes(fieldName);
+                    const statuses = leadStatusesText
+                      .split("\n")
+                      .map((status) => status.trim())
+                      .filter(Boolean);
+
+                    if (fieldName === "Status") {
+                      return (
+                        <label key={fieldName}>
+                          {fieldName} {isRequired ? "*" : ""}
+                          <select
+                            value={addLeadPreviewValues[fieldName] || ""}
+                            onChange={(event) =>
+                              updateAddLeadPreviewValue(fieldName, event.target.value)
+                            }
+                          >
+                            <option value="">Select status</option>
+                            {statuses.map((status) => (
+                              <option value={status} key={status}>
+                                {status}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      );
+                    }
+
+                    if (fieldName === "Notes") {
+                      return (
+                        <label key={fieldName}>
+                          {fieldName} {isRequired ? "*" : ""}
+                          <textarea
+                            value={addLeadPreviewValues[fieldName] || ""}
+                            onChange={(event) =>
+                              updateAddLeadPreviewValue(fieldName, event.target.value)
+                            }
+                            rows={4}
+                            placeholder="Add lead notes"
+                          />
+                        </label>
+                      );
+                    }
+
+                    return (
+                      <label key={fieldName}>
+                        {fieldName} {isRequired ? "*" : ""}
+                        <input
+                          type={fieldName.toLowerCase().includes("date") ? "date" : "text"}
+                          value={addLeadPreviewValues[fieldName] || ""}
+                          onChange={(event) =>
+                            updateAddLeadPreviewValue(fieldName, event.target.value)
+                          }
+                          placeholder={fieldName}
+                        />
+                      </label>
+                    );
+                  })}
+
+                <button className="primary-button" type="button">
+                  Submit Lead Preview
+                </button>
+              </div>
+            </div>
+
+            <div className="preview-meta-grid">
+              <div className="setup-step">
+                Form action: Create new lead record
+              </div>
+              <div className="setup-step">
+                Save target: Google Sheet tab “{leadsTabName.trim() || "Leads"}”
+              </div>
+              <div className="setup-step">
+                Runtime destination: Apps Script dashboard
+              </div>
+              <div className="setup-step">
+                Current mode: Preview only
+              </div>
+            </div>
+
+            <button
+              className="primary-button"
+              type="button"
+              onClick={handleSaveAddLeadFormPreview}
+              style={{ marginTop: 18 }}
+            >
+              Save Add Lead Form Preview
+            </button>
+          </section>
+
+          <section className={setupPage === "ai-plan" ? "panel" : "hidden-section"}>
+            <h2>AI Implementation Plan Preview</h2>
+            <p className="muted">
+              Review what UnScriptly plans to generate before Sync. This protects
+              the Sheet, confirms the generated Apps Script file set, and gives the
+              user a clear approval step.
+            </p>
+
+            <div className="ai-plan-actions">
+              <button
+                className="primary-button"
+                type="button"
+                onClick={handleGenerateAiImplementationPlan}
+              >
+                Generate AI Plan Preview
+              </button>
+
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={handleApproveAiImplementationPlan}
+              >
+                Approve Plan for Sync
+              </button>
+            </div>
+
+            {(aiPlanGenerated ||
+              selectedProject.setupStep === "ai_plan_ready" ||
+              selectedProject.setupStep === "sync_ready") && (
+              <div className="ai-plan-preview">
+                <div className="plan-card plan-card-wide">
+                  <p className="eyebrow">Plan Summary</p>
+                  <h3>Leads Dashboard Implementation</h3>
+                  <p className="muted">{getAiImplementationPlanPreview().summary}</p>
+                </div>
+
+                <div className="ai-plan-grid">
+                  <div className="plan-card">
+                    <h3>Sheet Changes</h3>
+                    <ul>
+                      {getAiImplementationPlanPreview().sheetChanges.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  <div className="plan-card">
+                    <h3>Apps Script Files</h3>
+                    <ul>
+                      {getAiImplementationPlanPreview().appsScriptFiles.map((fileName) => (
+                        <li key={fileName}>{fileName}</li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  <div className="plan-card">
+                    <h3>Generated Forms</h3>
+                    {getAiImplementationPlanPreview().forms.map((form) => (
+                      <div className="mini-record" key={form.name}>
+                        <strong>{form.name}</strong>
+                        <span>Type: {form.type}</span>
+                        <span>Target: {form.targetTab}</span>
+                        <span>Fields: {form.fields.length}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="plan-card">
+                    <h3>Runtime Actions</h3>
+                    <ul>
+                      {getAiImplementationPlanPreview().runtimeActions.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  <div className="plan-card">
+                    <h3>Safety Checks</h3>
+                    <ul>
+                      {getAiImplementationPlanPreview().safetyChecks.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  <div className="plan-card">
+                    <h3>Warnings</h3>
+                    <ul>
+                      {getAiImplementationPlanPreview().warnings.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+
+                <div className="preview-meta-grid">
+                  <div className="setup-step">
+                    Plan status: {aiPlanApproved || selectedProject.setupStep === "sync_ready" ? "Approved for Sync" : "Ready for Review"}
+                  </div>
+                  <div className="setup-step">
+                    Blockers: {getAiImplementationPlanPreview().blockers.length}
+                  </div>
+                  <div className="setup-step">
+                    Sync allowed: {aiPlanApproved || selectedProject.setupStep === "sync_ready" ? "Yes" : "No"}
+                  </div>
+                </div>
+              </div>
+            )}
+          </section>
+
+          <section className={setupPage === "google" ? "panel" : "hidden-section"}>
+            <h2>Google + Sheet Setup</h2>
+            <p className="muted">
+              Connect Google first, then choose or create the Google Sheet this project will use.
+            </p>
+
+            {(selectedProject.status === "google_connected" ||
+              selectedProject.status === "sheet_connected" ||
+              selectedProject.status === "script_project_created" ||
+              selectedProject.status === "leads_configured" ||
+              selectedProject.status === "synced") && (
+              <div className="connected-card">
+                <div>
+                  <p className="eyebrow">Google Connected</p>
+                  <h3>Google account is connected</h3>
+                  <p className="muted">
+                    UnScriptly can now create or update this project’s Google Sheet and Apps Script project.
+                  </p>
+                </div>
+                <span className="connected-badge">Connected</span>
+              </div>
+            )}
+
+            <div className="setup-action-stack">
+              <button
+                className="primary-button"
+                type="button"
+                onClick={handleRealConnectGoogle}
+              >
+                {(selectedProject.status === "google_connected" ||
+                  selectedProject.status === "sheet_connected" ||
+                  selectedProject.status === "script_project_created" ||
+                  selectedProject.status === "leads_configured" ||
+                  selectedProject.status === "synced")
+                  ? "Reconnect Google"
+                  : "Connect Google"}
+              </button>
+
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={handleRealChooseGoogleSheet}
+              >
+                Choose Google Sheet
+              </button>
+            </div>
+
+            {message && <div className="success-box" style={{ marginTop: 16 }}>{message}</div>}
+            {error && <div className="error-box" style={{ marginTop: 16 }}>{error}</div>}
+          </section>
+
+          <section className={setupPage === "app-script" ? "panel" : "hidden-section"}>
+            <h2>Apps Script Project</h2>
+            <p className="muted">
+              Create the Apps Script project that will eventually host the generated admin dashboard.
+            </p>
+
+            <button
+              className="primary-button"
+              type="button"
+              onClick={handleMockCreateAppsScriptProject}
+            >
+              Create Apps Script Project
+            </button>
+
+            {message && <div className="success-box" style={{ marginTop: 16 }}>{message}</div>}
+            {error && <div className="error-box" style={{ marginTop: 16 }}>{error}</div>}
+          </section>
+
+                    <section className={setupPage === "sync" ? "panel" : "hidden-section"}>
+            <h2>Sync Center Preview</h2>
+            <p className="muted">
+              Review exactly what UnScriptly will do before any real Sync touches
+              Google Sheets or Apps Script. This is a safety gate, not the real Sync.
+            </p>
+
+            <div className="sync-status-banner">
+              <div>
+                <p className="eyebrow">Sync Status</p>
+                <h3>
+                  {getSyncCenterPreview().isPlanApproved
+                    ? "Ready for Pre-Sync Review"
+                    : "Waiting on AI Plan Approval"}
+                </h3>
+                <p className="muted">
+                  Real Sync remains locked until review is complete. This project has passed the safe Sync MVP once synced.
+                </p>
+              </div>
+
+              <span className={getSyncCenterPreview().isPlanApproved ? "sync-pill ready" : "sync-pill blocked"}>
+                {getSyncCenterPreview().isPlanApproved ? "Ready" : "Blocked"}
+              </span>
+            </div>
+
+            <div className="sync-grid">
+              <div className="plan-card">
+                <h3>Readiness Checklist</h3>
+                <div className="sync-check-list">
+                  {getSyncCenterPreview().readinessItems.map((item) => (
+                    <div className={item.ready ? "sync-check done" : "sync-check"} key={item.label}>
+                      <span>{item.ready ? "✓" : "•"}</span>
+                      <strong>{item.label}</strong>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="plan-card">
+                <h3>Sheet Changes Preview</h3>
+                <ul>
+                  {getSyncCenterPreview().sheetChanges.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+
+              <div className="plan-card">
+                <h3>Apps Script Changes Preview</h3>
+                <ul>
+                  {getSyncCenterPreview().scriptChanges.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+
+              <div className="plan-card">
+                <h3>Safety Rules</h3>
+                <ul>
+                  {getSyncCenterPreview().safetyRules.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+
+            {getSyncCenterPreview().blockedReasons.length > 0 && (
+              <div className="sync-blockers">
+                <h3>Blocked Reasons</h3>
+                <ul>
+                  {getSyncCenterPreview().blockedReasons.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            <div className="sync-confirm-box">
+              <h3>What happens next?</h3>
+              <p className="muted">
+                Saving this review does not run Sync. It only records that the user
+                has reviewed the proposed Sheet changes, Apps Script changes, safety
+                rules, and blockers. The next build will add the real Sync engine.
+              </p>
+
+              <button
+                className="primary-button"
+                type="button"
+                onClick={handleSaveSyncCenterPreview}
+              >
+                Save Pre-Sync Review
+              </button>
+
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={handleRunSyncMvp}
+                style={{ marginLeft: 12 }}
+              >
+                Run Real Google Sync
+              </button>
+            </div>
+
+            {message && <div className="success-box" style={{ marginTop: 16 }}>{message}</div>}
+            {error && <div className="error-box" style={{ marginTop: 16 }}>{error}</div>}
+          </section>
+
+<section className="panel project-record-panel">
+            <h2>Project Record</h2>
+            <div className="setup-list">
+              <div className="setup-step">Project ID: {selectedProject.id}</div>
+              <div className="setup-step">Status: {selectedProject.status}</div>
+              <div className="setup-step">Setup Step: {selectedProject.setupStep}</div>
+            </div>
+          </section>
+        </section>
+      </main>
+    );
+  }
+
+  return (
+    <main className="dashboard-shell">
+      <aside className="sidebar">
+        <div className="sidebar-brand">
+          <div className="brand-mark small">U</div>
+          <div>
+            <strong>UnScriptly</strong>
+            <span>Control Center</span>
+          </div>
+        </div>
+
+        <nav>
+          <a className="active">Dashboard</a>
+          <a>Projects</a>
+          <a>Setup</a>
+          <a>Features</a>
+          <a className="locked">Forms</a>
+          <a className="locked">AI Plan</a>
+          <a className="locked">Sync</a>
+          <a className="locked">Deploy</a>
+          <a>Settings</a>
+        </nav>
+      </aside>
+
+      <section className="dashboard-main">
+        <header className="dashboard-header">
+          <div>
+            <p className="eyebrow">Dashboard</p>
+            <h1>Projects</h1>
+            <p className="muted">
+              Build and manage your Google Sheets-powered dashboards.
+            </p>
+          </div>
+
+          <div className="user-menu">
+            <div className="avatar">{userInitial}</div>
+            <div>
+              <strong>{user.email}</strong>
+              <button onClick={handleLogout} type="button">
+                Logout
+              </button>
+            </div>
+          </div>
+        </header>
+
+        <section className="grid-layout">
+          <div className="panel">
+            <h2>Create Project</h2>
+            <p className="muted">
+              Start with one business, one Google Sheet, and one Apps Script
+              dashboard.
+            </p>
+
+            <div className="form-stack">
+              <label>
+                Project Name
+                <input
+                  type="text"
+                  placeholder="ABC Roofing Dashboard"
+                  value={projectName}
+                  onChange={(event) => setProjectName(event.target.value)}
+                  required
+                />
+              </label>
+
+              <label>
+                Business Name
+                <input
+                  type="text"
+                  placeholder="ABC Roofing"
+                  value={businessName}
+                  onChange={(event) => setBusinessName(event.target.value)}
+                  required
+                />
+              </label>
+
+              <label>
+                Business Type
+                <select
+                  value={businessType}
+                  onChange={(event) => setBusinessType(event.target.value)}
+                >
+                  <option>Roofing</option>
+                  <option>HVAC</option>
+                  <option>Plumbing</option>
+                  <option>Electrical</option>
+                  <option>Landscaping</option>
+                  <option>Cleaning</option>
+                  <option>Pest Control</option>
+                  <option>Pool Service</option>
+                  <option>Handyman</option>
+                  <option>Other Home Service</option>
+                </select>
+              </label>
+
+              <button
+                className="primary-button"
+                type="button"
+                onClick={handleCreateProject}
+              >
+                Create Project
+              </button>
+            </div>
+
+            {error && <div className="error-box">{error}</div>}
+            {message && <div className="success-box">{message}</div>}
+          </div>
+
+          <div className="panel">
+            <h2>Setup Path</h2>
+            <p className="muted">
+              Each project moves through the UnScriptly build lifecycle.
+            </p>
+
+            <div className="setup-list">
+              <div className="setup-step done">Project Created</div>
+              <div className="setup-step">Connect Google</div>
+              <div className="setup-step">Choose Google Sheet</div>
+              <div className="setup-step">Create App Project</div>
+              <div className="setup-step">Enable Leads</div>
+              <div className="setup-step locked">Forms</div>
+              <div className="setup-step locked">AI Plan</div>
+              <div className="setup-step locked">Sync</div>
+              <div className="setup-step locked">Deploy</div>
+            </div>
+          </div>
+        </section>
+
+        <section className="panel project-panel">
+          <div className="panel-header">
+            <div>
+              <h2>Your Projects</h2>
+              <p className="muted">
+                Continue setup or review project progress.
+              </p>
+            </div>
+            <span className="count-pill">{projects.length} total</span>
+          </div>
+
+          {loadingProjects ? (
+            <p className="muted">Loading projects...</p>
+          ) : projects.length === 0 ? (
+            <div className="empty-state">
+              <h3>No projects yet</h3>
+              <p>
+                Create your first UnScriptly project to begin connecting Google,
+                mapping Leads, and preparing your dashboard.
+              </p>
+            </div>
+          ) : (
+            <div className="project-list">
+              {projects.map((project) => (
+                <article className="project-card" key={project.id}>
+                  <div>
+                    <h3>{project.projectName}</h3>
+                    <p>
+                      {project.businessName} · {project.businessType}
+                    </p>
+                  </div>
+
+                  <div className="project-meta">
+                    <span className="status-badge">{project.status}</span>
+                    <span>{project.setupStep}</span>
+                  </div>
+
+                  <div className="project-progress">
+                    {projectStatuses.map((status) => (
+                      <span
+                        key={status}
+                        className={
+                          project.status === status ? "dot active" : "dot"
+                        }
+                      />
+                    ))}
+                  </div>
+
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => {
+                      setSelectedProject(project);
+                      setSetupPage("overview");
+                    }}
+                  >
+                    Continue Setup
+                  </button>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      </section>
+    </main>
+  );
+}
+
+export default App;

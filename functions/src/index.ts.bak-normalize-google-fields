@@ -1,0 +1,608 @@
+import {onCall, HttpsError, onRequest} from "firebase-functions/v2/https";
+import {defineSecret} from "firebase-functions/params";
+import * as admin from "firebase-admin";
+import {google} from "googleapis";
+import {randomUUID} from "crypto";
+
+admin.initializeApp();
+
+
+const db = admin.firestore();
+
+const GOOGLE_OAUTH_CLIENT_ID = defineSecret("GOOGLE_OAUTH_CLIENT_ID");
+const GOOGLE_OAUTH_CLIENT_SECRET = defineSecret("GOOGLE_OAUTH_CLIENT_SECRET");
+const GOOGLE_OAUTH_REDIRECT_URI = defineSecret("GOOGLE_OAUTH_REDIRECT_URI");
+
+const GOOGLE_SCOPES = [
+  "openid",
+  "email",
+  "profile",
+  "https://www.googleapis.com/auth/drive.file",
+  "https://www.googleapis.com/auth/spreadsheets",
+  "https://www.googleapis.com/auth/script.projects",
+  "https://www.googleapis.com/auth/script.deployments",
+];
+
+function getOAuthClient() {
+  return new google.auth.OAuth2(
+    GOOGLE_OAUTH_CLIENT_ID.value(),
+    GOOGLE_OAUTH_CLIENT_SECRET.value(),
+    GOOGLE_OAUTH_REDIRECT_URI.value()
+  );
+}
+
+function requireAuth(request: any) {
+  if (!request.auth?.uid) {
+    throw new HttpsError("unauthenticated", "You must be signed in.");
+  }
+
+  return request.auth.uid as string;
+}
+
+async function getGoogleClientForUser(uid: string) {
+  const connectionSnap = await db.collection("googleConnections").doc(uid).get();
+
+  if (!connectionSnap.exists) {
+    throw new HttpsError("failed-precondition", "Connect Google before syncing.");
+  }
+
+  const refreshToken = connectionSnap.data()?.refreshToken;
+
+  if (!refreshToken) {
+    throw new HttpsError("failed-precondition", "Google refresh token missing. Reconnect Google.");
+  }
+
+  const oauthClient = getOAuthClient();
+  oauthClient.setCredentials({refresh_token: refreshToken});
+
+  return oauthClient;
+}
+
+function getSystemTabs() {
+  return [
+    "_UNSCRIPTLY_CONFIG",
+    "_UNSCRIPTLY_AUDIT_LOG",
+    "_UNSCRIPTLY_SYNC_LOG",
+    "_UNSCRIPTLY_LOOKUPS",
+  ];
+}
+
+function getLeadHeaders() {
+  return [
+    "Lead ID",
+    "Customer Name",
+    "Phone",
+    "Email",
+    "Service Type",
+    "Lead Source",
+    "Status",
+    "Assigned To",
+    "Next Follow-Up Date",
+    "Created At",
+    "Created By",
+    "Updated At",
+    "Updated By",
+    "Archived",
+    "Notes",
+  ];
+}
+
+function columnLetter(columnNumber: number) {
+  let temp = columnNumber;
+  let letter = "";
+
+  while (temp > 0) {
+    const remainder = (temp - 1) % 26;
+    letter = String.fromCharCode(65 + remainder) + letter;
+    temp = Math.floor((temp - remainder) / 26);
+  }
+
+  return letter;
+}
+
+function generateAppsScriptFiles(leadsTabName: string) {
+  return [
+    {
+      name: "appsscript",
+      type: "JSON",
+      source: JSON.stringify(
+        {
+          timeZone: "America/Chicago",
+          exceptionLogging: "STACKDRIVER",
+          runtimeVersion: "V8",
+          webapp: {
+            executeAs: "USER_DEPLOYING",
+            access: "ANYONE_ANONYMOUS",
+          },
+          oauthScopes: [
+            "https://www.googleapis.com/auth/spreadsheets.currentonly",
+            "https://www.googleapis.com/auth/userinfo.email",
+          ],
+        },
+        null,
+        2
+      ),
+    },
+    {
+      name: "Code",
+      type: "SERVER_JS",
+      source: `
+function doGet() {
+  return HtmlService.createTemplateFromFile("Admin")
+    .evaluate()
+    .setTitle("UnScriptly Dashboard")
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+`,
+    },
+    {
+      name: "ClientConfig",
+      type: "SERVER_JS",
+      source: `
+var UNS_CONFIG = {
+  appName: "UnScriptly Dashboard",
+  leadsTabName: "${leadsTabName}"
+};
+`,
+    },
+    {
+      name: "RuntimeData",
+      type: "SERVER_JS",
+      source: `
+function getSpreadsheet_() {
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
+
+function getTab_(tabName) {
+  var sheet = getSpreadsheet_().getSheetByName(tabName);
+  if (!sheet) throw new Error("Missing tab: " + tabName);
+  return sheet;
+}
+
+function getHeaders_(sheet) {
+  return sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+}
+`,
+    },
+    {
+      name: "RuntimeActions",
+      type: "SERVER_JS",
+      source: `
+function createLead(payload) {
+  var sheet = getTab_(UNS_CONFIG.leadsTabName);
+  var headers = getHeaders_(sheet);
+  var now = new Date();
+
+  var row = headers.map(function(header) {
+    if (header === "Lead ID") return "LEAD-" + now.getTime();
+    if (header === "Created At" || header === "Updated At") return now;
+    if (header === "Archived") return false;
+    return payload[header] || "";
+  });
+
+  sheet.appendRow(row);
+  return {ok: true};
+}
+`,
+    },
+    {
+      name: "Admin",
+      type: "HTML",
+      source: `
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <?!= include("Styles"); ?>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="hero">
+        <p class="eyebrow">UnScriptly</p>
+        <h1>Leads Dashboard</h1>
+        <p>Private Apps Script dashboard generated by UnScriptly.</p>
+      </section>
+      <?!= include("Forms"); ?>
+    </main>
+    <?!= include("Scripts"); ?>
+  </body>
+</html>
+`,
+    },
+    {
+      name: "Styles",
+      type: "HTML",
+      source: `
+<style>
+  body { margin: 0; font-family: Arial, sans-serif; background: #f8fafc; color: #111827; }
+  .app-shell { max-width: 960px; margin: 0 auto; padding: 32px; }
+  .hero, .form-card { border: 1px solid #e5e7eb; border-radius: 20px; padding: 24px; background: #fff; margin-bottom: 20px; }
+  .eyebrow { text-transform: uppercase; letter-spacing: .12em; font-size: 12px; font-weight: 800; }
+  label { display: grid; gap: 6px; margin-bottom: 12px; font-weight: 700; }
+  input, select, textarea { border: 1px solid #d1d5db; border-radius: 10px; padding: 10px; }
+  button { border: 0; border-radius: 10px; padding: 11px 14px; color: white; background: #111827; font-weight: 800; }
+</style>
+`,
+    },
+    {
+      name: "Scripts",
+      type: "HTML",
+      source: `
+<script>
+  function submitLeadForm(event) {
+    event.preventDefault();
+
+    var form = event.target;
+    var payload = {};
+
+    Array.prototype.slice.call(form.elements).forEach(function(input) {
+      if (input.name) payload[input.name] = input.value;
+    });
+
+    google.script.run
+      .withSuccessHandler(function() {
+        alert("Lead created.");
+        form.reset();
+      })
+      .withFailureHandler(function(error) {
+        alert(error.message || "Could not create lead.");
+      })
+      .createLead(payload);
+  }
+</script>
+`,
+    },
+    {
+      name: "Forms",
+      type: "HTML",
+      source: `
+<section class="form-card">
+  <h2>Add Lead</h2>
+  <form onsubmit="submitLeadForm(event)">
+    <label>Customer Name <input name="Customer Name" required></label>
+    <label>Phone <input name="Phone" required></label>
+    <label>Email <input name="Email"></label>
+    <label>Service Type <input name="Service Type" required></label>
+    <label>Lead Source <input name="Lead Source"></label>
+    <label>Status
+      <select name="Status" required>
+        <option>New</option>
+        <option>Contacted</option>
+        <option>Estimate Scheduled</option>
+        <option>Estimate Sent</option>
+        <option>Won</option>
+        <option>Lost</option>
+      </select>
+    </label>
+    <label>Notes <textarea name="Notes"></textarea></label>
+    <button type="submit">Create Lead</button>
+  </form>
+</section>
+`,
+    },
+  ];
+}
+
+export const startGoogleOAuth = onCall(
+  {
+    region: "us-central1",
+    secrets: [
+      GOOGLE_OAUTH_CLIENT_ID,
+      GOOGLE_OAUTH_CLIENT_SECRET,
+      GOOGLE_OAUTH_REDIRECT_URI,
+    ],
+  },
+  async (request) => {
+    const uid = requireAuth(request);
+    const projectId = request.data?.projectId as string | undefined;
+
+    if (!projectId) {
+      throw new HttpsError("invalid-argument", "projectId is required.");
+    }
+
+    const stateId = randomUUID();
+
+    await db.collection("oauthStates").doc(stateId).set({
+      uid,
+      projectId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const oauthClient = getOAuthClient();
+
+    const url = oauthClient.generateAuthUrl({
+      access_type: "offline",
+      include_granted_scopes: true,
+      prompt: "consent",
+      scope: GOOGLE_SCOPES,
+      state: stateId,
+    });
+
+    return {url};
+  }
+);
+
+export const googleOAuthCallback = onRequest(
+  {
+    region: "us-central1",
+    secrets: [
+      GOOGLE_OAUTH_CLIENT_ID,
+      GOOGLE_OAUTH_CLIENT_SECRET,
+      GOOGLE_OAUTH_REDIRECT_URI,
+    ],
+  },
+  async (req, res) => {
+    try {
+      const code = String(req.query.code || "");
+      const stateId = String(req.query.state || "");
+
+      if (!code || !stateId) {
+        res.status(400).send("Missing OAuth code or state.");
+        return;
+      }
+
+      const stateRef = db.collection("oauthStates").doc(stateId);
+      const stateSnap = await stateRef.get();
+
+      if (!stateSnap.exists) {
+        res.status(400).send("Invalid OAuth state.");
+        return;
+      }
+
+      const state = stateSnap.data() || {};
+      const uid = state.uid;
+      const projectId = state.projectId;
+
+      const oauthClient = getOAuthClient();
+      const tokenResponse = await oauthClient.getToken(code);
+      const tokens = tokenResponse.tokens;
+
+      oauthClient.setCredentials(tokens);
+
+      const oauth2 = google.oauth2({
+        version: "v2",
+        auth: oauthClient,
+      });
+
+      const userInfo = await oauth2.userinfo.get();
+
+      await db.collection("googleConnections").doc(uid).set(
+        {
+          uid,
+          googleEmail: userInfo.data.email || "",
+          refreshToken: tokens.refresh_token || "",
+          scope: tokens.scope || "",
+          connectedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        {merge: true}
+      );
+
+      await db.collection("projects").doc(projectId).set(
+        {
+          status: "google_connected",
+          setupStep: "google_connected",
+          googleConnected: true,
+          googleEmail: userInfo.data.email || "",
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        {merge: true}
+      );
+
+      await stateRef.delete();
+
+      res.redirect(
+        `https://unscriptly.web.app/?projectId=${encodeURIComponent(
+          projectId
+        )}&setupPage=google&googleConnected=1`
+      );
+    } catch (error: any) {
+      res.status(500).send(error.message || "OAuth failed.");
+    }
+  }
+);
+
+export const runRealSync = onCall(
+  {
+    region: "us-central1",
+    timeoutSeconds: 300,
+    memory: "1GiB",
+    secrets: [
+      GOOGLE_OAUTH_CLIENT_ID,
+      GOOGLE_OAUTH_CLIENT_SECRET,
+      GOOGLE_OAUTH_REDIRECT_URI,
+    ],
+  },
+  async (request) => {
+    const uid = requireAuth(request);
+    const projectId = request.data?.projectId as string | undefined;
+
+    if (!projectId) {
+      throw new HttpsError("invalid-argument", "projectId is required.");
+    }
+
+    const projectRef = db.collection("projects").doc(projectId);
+    const projectSnap = await projectRef.get();
+
+    if (!projectSnap.exists) {
+      throw new HttpsError("not-found", "Project not found.");
+    }
+
+    const project = projectSnap.data() || {};
+
+    if (project.ownerUserId !== uid && project.createdByUid !== uid) {
+      throw new HttpsError("permission-denied", "You do not own this project.");
+    }
+
+    const auth = await getGoogleClientForUser(uid);
+
+    const sheets = google.sheets({version: "v4", auth});
+    const script = google.script({version: "v1", auth});
+
+    const businessName = project.businessName || "UnScriptly";
+    const spreadsheetTitle =
+      project.spreadsheetName || `${businessName} - UnScriptly Operations`;
+
+    let spreadsheetId = project.spreadsheetId || "";
+    let spreadsheetUrl = project.spreadsheetUrl || "";
+
+    if (!spreadsheetId) {
+      const createdSpreadsheet = await sheets.spreadsheets.create({
+        requestBody: {
+          properties: {title: spreadsheetTitle},
+          sheets: [
+            {properties: {title: "Leads"}},
+            ...getSystemTabs().map((title) => ({properties: {title}})),
+          ],
+        },
+      });
+
+      spreadsheetId = createdSpreadsheet.data.spreadsheetId || "";
+      spreadsheetUrl = createdSpreadsheet.data.spreadsheetUrl || "";
+    }
+
+    const spreadsheet = await sheets.spreadsheets.get({
+      spreadsheetId,
+      includeGridData: false,
+    });
+
+    const existingSheets =
+      spreadsheet.data.sheets?.map((sheet) => sheet.properties?.title || "") || [];
+
+    const neededTabs = ["Leads", ...getSystemTabs()];
+    const missingTabs = neededTabs.filter((tab) => !existingSheets.includes(tab));
+
+    if (missingTabs.length > 0) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: {
+          requests: missingTabs.map((title) => ({
+            addSheet: {properties: {title}},
+          })),
+        },
+      });
+    }
+
+    const headers = getLeadHeaders();
+
+    const headerRead = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: "Leads!1:1",
+    });
+
+    const existingHeaders =
+      headerRead.data.values && headerRead.data.values.length > 0 ?
+        headerRead.data.values[0] :
+        [];
+
+    const missingHeaders = headers.filter(
+      (header) => !existingHeaders.includes(header)
+    );
+
+    const finalHeaders = [...existingHeaders, ...missingHeaders];
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `Leads!A1:${columnLetter(finalHeaders.length)}1`,
+      valueInputOption: "RAW",
+      requestBody: {values: [finalHeaders]},
+    });
+
+    let scriptId = project.scriptProjectId || "";
+    let scriptProjectName = project.scriptProjectName || "";
+
+    if (!scriptId) {
+      const createdScriptProject = await script.projects.create({
+        requestBody: {
+          title: `UnScriptly - ${businessName}`,
+          parentId: spreadsheetId,
+        },
+      });
+
+      scriptId = createdScriptProject.data.scriptId || "";
+      scriptProjectName =
+        createdScriptProject.data.title || `UnScriptly - ${businessName}`;
+    }
+
+    const appsScriptFiles = generateAppsScriptFiles("Leads");
+
+    await script.projects.updateContent({
+      scriptId,
+      requestBody: {
+        files: appsScriptFiles as any,
+      },
+    });
+
+    const syncRunId = `${projectId}_${Date.now()}`;
+
+    await db.collection("schemaSnapshots").doc(`${projectId}_latest`).set({
+      projectId,
+      snapshotType: "real_google_sync_schema",
+      spreadsheetId,
+      spreadsheetUrl,
+      tabs: neededTabs,
+      leadsHeaders: finalHeaders,
+      addedTabs: missingTabs,
+      addedHeaders: missingHeaders,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await db.collection("scriptSnapshots").doc(`${projectId}_latest`).set({
+      projectId,
+      snapshotType: "real_google_sync_script",
+      scriptId,
+      scriptProjectName,
+      fileCount: appsScriptFiles.length,
+      files: appsScriptFiles,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await db.collection("syncRuns").doc(syncRunId).set({
+      projectId,
+      runType: "real_google_sync",
+      status: "completed",
+      touchedGoogleSheets: true,
+      touchedAppsScript: true,
+      spreadsheetId,
+      spreadsheetUrl,
+      scriptId,
+      scriptProjectName,
+      addedTabs: missingTabs,
+      addedHeaders: missingHeaders,
+      generatedAppsScriptFiles: appsScriptFiles.map((file) => file.name),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await projectRef.set(
+      {
+        status: "synced",
+        setupStep: "synced_real",
+        spreadsheetId,
+        spreadsheetName: spreadsheetTitle,
+        spreadsheetUrl,
+        scriptProjectId: scriptId,
+        scriptProjectName,
+        lastSyncRunId: syncRunId,
+        syncedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      {merge: true}
+    );
+
+    return {
+      ok: true,
+      syncRunId,
+      spreadsheetId,
+      spreadsheetUrl,
+      scriptId,
+      scriptProjectName,
+      addedTabs: missingTabs,
+      addedHeaders: missingHeaders,
+    };
+  }
+);
