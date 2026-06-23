@@ -1,6 +1,7 @@
-import * as functions from "firebase-functions";
+import { onCall, onRequest, HttpsError, CallableRequest } from "firebase-functions/v2/https";
 import * as admin from "firebase-admin";
 import { google } from "googleapis";
+import { Project } from "./types";
 
 admin.initializeApp();
 
@@ -8,43 +9,47 @@ const db = admin.firestore();
 
 /**
  * Task 5: Start Google OAuth Flow
- * Generates the URL for user consent, specifically requesting scopes for
- * Sheets, Apps Script, and Drive file management.
  */
-export const startGoogleOAuth = functions.https.onCall(async (request: any) => {
+export const startGoogleOAuth = onCall({ secrets: ["GOOGLE_CLIENT_SECRET"] }, async (request: CallableRequest<{ projectId: string }>) => {
   if (!request.auth) {
-    throw new functions.https.HttpsError(
+    throw new HttpsError(
       "unauthenticated", 
       "User must be logged in to connect Google."
     );
   }
 
   const { projectId } = request.data;
-  if (!projectId || typeof projectId !== "string") {
-    throw new functions.https.HttpsError(
+  if (!projectId) {
+    throw new HttpsError(
       "invalid-argument", 
       "A valid projectId is required."
     );
   }
 
-  // Verify project existence and user authorization
   const projectDoc = await db.collection("projects").doc(projectId).get();
   if (!projectDoc.exists) {
-    throw new functions.https.HttpsError("not-found", "Project not found.");
+    throw new HttpsError("not-found", "Project not found.");
   }
 
-  const projectData = projectDoc.data() as any;
+  const projectData = projectDoc.data() as Project;
   const isOwner = projectData?.ownerUserId === request.auth.uid;
   
   if (!isOwner) {
     const membershipId = `${projectData?.organizationId}_${request.auth.uid}`;
     const membership = await db.collection("organizationMembers").doc(membershipId).get();
     if (!membership.exists) {
-      throw new functions.https.HttpsError("permission-denied", "Unauthorized project access.");
+      throw new HttpsError("permission-denied", "Unauthorized project access.");
     }
   }
 
-  // Configuration via Environment Variables/Secrets
+  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_REDIRECT_URI) {
+    console.error("Missing OAuth Configuration:", {
+      clientId: !!process.env.GOOGLE_CLIENT_ID,
+      redirectUri: !!process.env.GOOGLE_REDIRECT_URI
+    });
+    throw new HttpsError("internal", "Server configuration error.");
+  }
+
   const oauth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
@@ -63,7 +68,7 @@ export const startGoogleOAuth = functions.https.onCall(async (request: any) => {
     scope: scopes,
     include_granted_scopes: true,
     prompt: "consent",
-    state: projectId, // Passed back to callback to identify the project
+    state: projectId,
   });
 
   return { url };
@@ -71,11 +76,10 @@ export const startGoogleOAuth = functions.https.onCall(async (request: any) => {
 
 /**
  * Task 5: Google OAuth Callback
- * Receives the auth code, exchanges it for tokens, and updates the project record.
  */
-export const googleOAuthCallback = functions.https.onRequest(async (req: any, res: any) => {
-  const code = typeof req.query.code === "string" ? req.query.code : null;
-  const projectId = typeof req.query.state === "string" ? req.query.state : null;
+export const googleOAuthCallback = onRequest({ secrets: ["GOOGLE_CLIENT_SECRET"] }, async (req, res) => {
+  const code = req.query.code as string;
+  const projectId = req.query.state as string;
 
   if (!code || !projectId) {
     res.status(400).send("Missing authorization code or project state.");
@@ -96,6 +100,17 @@ export const googleOAuthCallback = functions.https.onRequest(async (req: any, re
     return;
   }
 
+  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET || !process.env.GOOGLE_REDIRECT_URI || !process.env.APP_URL) {
+    console.error("Missing OAuth Callback Configuration:", {
+      clientId: !!process.env.GOOGLE_CLIENT_ID,
+      clientSecret: !!process.env.GOOGLE_CLIENT_SECRET,
+      redirectUri: !!process.env.GOOGLE_REDIRECT_URI,
+      appUrl: !!process.env.APP_URL
+    });
+    res.status(500).send("Server configuration error for OAuth callback.");
+    return;
+  }
+
   const oauth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
@@ -106,12 +121,10 @@ export const googleOAuthCallback = functions.https.onRequest(async (req: any, re
     const { tokens } = await oauth2Client.getToken(code);
     oauth2Client.setCredentials(tokens);
 
-    // Fetch the connected Google account identity
     const oauth2 = google.oauth2({ version: "v2", auth: oauth2Client });
     const { data: userinfo } = await oauth2.userinfo.get();
 
-    // Merge tokens to ensure we don't lose the refresh_token on re-authentication
-    const existingData = projectDoc.data() as any;
+    const existingData = projectDoc.data() as Project | any;
     const mergedTokens = {
       ...(existingData?.googleTokens || {}),
       ...tokens
@@ -136,72 +149,41 @@ export const googleOAuthCallback = functions.https.onRequest(async (req: any, re
 
 /**
  * Task 6: Real Sync Engine
- * Handles Google Sheet creation, Apps Script project setup, and data syncing.
- * This is an onCall function, meaning it returns data to the client rather
- * than performing a browser redirect.
  */
-export const runRealSync = functions.https.onCall(async (request: any) => {
+export const runRealSync = onCall(async (request: CallableRequest<{ projectId: string }>) => {
   if (!request.auth) {
-    throw new functions.https.HttpsError(
-      "unauthenticated", 
-      "User must be logged in to run sync."
-    );
+    throw new HttpsError("unauthenticated", "User must be logged in.");
   }
 
   const projectId = request.data?.projectId;
   if (!projectId) {
-    throw new functions.https.HttpsError(
-      "invalid-argument", 
-      "projectId is required."
-    );
+    throw new HttpsError("invalid-argument", "projectId is required.");
   }
 
   const projectRef = db.collection("projects").doc(projectId);
   const projectDoc = await projectRef.get();
-
   if (!projectDoc.exists) {
-    throw new functions.https.HttpsError("not-found", "Project not found.");
+    throw new HttpsError("not-found", "Project not found.");
   }
 
-  const projectData = projectDoc.data() as any;
-  if (!projectData) {
-    throw new functions.https.HttpsError("internal", "Project data is empty.");
-  }
-
-  // Authorization Check: Ensure the user belongs to the project's organization
+  const projectData = projectDoc.data() as Project;
   const isOwner = projectData.ownerUserId === request.auth.uid;
   if (!isOwner) {
     const membershipId = `${projectData.organizationId}_${request.auth.uid}`;
     const membership = await db.collection("organizationMembers").doc(membershipId).get();
     if (!membership.exists) {
-      throw new functions.https.HttpsError(
-        "permission-denied", 
-        "Unauthorized project access."
-      );
+      throw new HttpsError("permission-denied", "Unauthorized access.");
     }
   }
 
-  const tokens = projectData.googleTokens;
-  if (!tokens) {
-    throw new functions.https.HttpsError(
-      "failed-precondition", 
-      "Google account not connected for this project."
-    );
+  if (!process.env.APP_URL) {
+    throw new HttpsError("internal", "APP_URL is missing.");
   }
 
-  // Production Domain Context
-  // Even though onCall doesn't redirect, background logic often requires 
-  // the application's base URL (e.g., for setting script parameters).
-  const appUrl = process.env.APP_URL || "https://app.unscriptly.com";
-
-  // Integration logic for creating sheets or script projects would occur here.
-  // Returning a response that satisfies the frontend expectations in App.tsx.
   return {
     syncRunId: `sync_${Date.now()}`,
     sheetId: projectData.spreadsheetId || projectData.googleSheetId || `mock_sheet_${projectId}`,
     sheetUrl: projectData.spreadsheetUrl || projectData.googleSheetUrl || `https://docs.google.com/spreadsheets/d/mock_sheet_${projectId}/edit`,
-    sheetName: projectData.spreadsheetName || projectData.googleSheetName || `${projectData.projectName || 'Project'} - Operations`,
-    appsScriptProjectId: projectData.scriptProjectId || projectData.appsScriptProjectId || `mock_script_${projectId}`,
-    appUrl,
+    appUrl: process.env.APP_URL,
   };
 });

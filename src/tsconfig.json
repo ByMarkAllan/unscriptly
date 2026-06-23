@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "es2020",
+    "lib": ["es2020"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "lib",
+    "rootDir": "."
+  },
+  "compileOnSave": true,
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules", "lib", "firebase.ts"] // Exclude node_modules, the output directory, and the client-side firebase.ts
+}

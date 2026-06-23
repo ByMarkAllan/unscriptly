@@ -1,4 +1,4 @@
-import { initializeApp } from "firebase/app";
+import { initializeApp, type FirebaseApp } from "firebase/app";
 import { useEffect, useMemo, useState } from "react";
 import {
   createUserWithEmailAndPassword,
@@ -6,9 +6,11 @@ import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
   signOut,
+  type Auth,
   type User,
 } from "firebase/auth";
 import {
+  Firestore,
   addDoc,
   collection,
   doc,
@@ -22,7 +24,7 @@ import {
   updateDoc,
   where,
 } from "firebase/firestore";
-import { httpsCallable, getFunctions } from "firebase/functions";
+import { httpsCallable, getFunctions, type Functions } from "firebase/functions";
 import "./index.css";
 import type {
   Project,
@@ -59,10 +61,10 @@ const firebaseConfig = {
 };
 
 // Initialize Firebase Services
-let app: any;
-let auth: any;
-let db: any;
-let functions: any;
+let app: FirebaseApp | undefined;
+let auth: Auth | undefined;
+let db: Firestore | undefined;
+let functions: Functions | undefined;
 
 try {
   app = initializeApp(firebaseConfig);
@@ -242,6 +244,11 @@ function App() {
 
   // Centralized Helper for Project Updates
   const updateProjectPersistence = async (projectId: string, updates: Partial<Project>) => {
+    if (!db) {
+      setError("Database connection not initialized.");
+      return false;
+    }
+
     try {
       const ref = doc(db, "projects", projectId);
       const normalizedUpdates = prepareProjectUpdate(updates);
@@ -255,6 +262,11 @@ function App() {
   };
 
   async function loadUserOrgs(uid: string) {
+    if (!db) {
+      setError("Database connection not initialized.");
+      return [];
+    }
+
     const mQuery = query(
       collection(db, "organizationMembers"),
       where("userId", "==", uid)
@@ -276,13 +288,15 @@ function App() {
   }
 
   useEffect(() => {
+    if (!auth || !db) return;
+
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       setUser(currentUser);
       setAuthReady(true);
 
       if (currentUser) {
         await setDoc(
-          doc(db, "users", currentUser.uid),
+          doc(db!, "users", currentUser.uid),
           {
             uid: currentUser.uid,
             email: currentUser.email,
@@ -319,6 +333,8 @@ function App() {
   }, [user, activeOrgId, userOrgs]);
 
   async function loadOrgMembers(orgId: string) {
+    if (!db) return;
+
     try {
       const mQuery = query(
         collection(db, "organizationMembers"),
@@ -345,6 +361,11 @@ function App() {
   }
 
   async function loadProjects(orgId: string) {
+    if (!db) {
+      setError("Database connection not initialized.");
+      return;
+    }
+
     setLoadingProjects(true);
     setError("");
 
@@ -389,17 +410,27 @@ function App() {
     setError("");
     setMessage("");
 
+    if (!auth || !db) {
+      setError("Firebase services are not available. Check configuration.");
+      return;
+    }
+
     try {
       if (mode === "signup") {
         const result = await createUserWithEmailAndPassword(auth, email, password);
         const uid = result.user.uid;
 
+        if (!db) {
+          setError("Database not initialized.");
+          return;
+        }
+
         // Section 11.4: Organization Bootstrap
-        const orgRef = doc(collection(db, "organizations"));
+        const orgRef = doc(collection(db!, "organizations"));
         const organizationId = orgRef.id;
         const orgName = `${email.split("@")[0]}'s Workspace`;
 
-        await setDoc(orgRef, {
+        await setDoc(orgRef!, {
           id: organizationId,
           name: orgName,
           createdAt: serverTimestamp(),
@@ -407,7 +438,7 @@ function App() {
           createdByUid: uid,
         });
 
-        await setDoc(doc(db, "organizationMembers", `${organizationId}_${uid}`), {
+        await setDoc(doc(db!, "organizationMembers", `${organizationId}_${uid}`), {
           organizationId,
           userId: uid,
           role: "Owner",
@@ -416,7 +447,7 @@ function App() {
           createdByUid: uid,
         });
 
-        await setDoc(doc(db, "users", uid), {
+        await setDoc(doc(db!, "users", uid), {
           uid: uid,
           email: result.user.email,
           displayName: "",
@@ -441,16 +472,16 @@ function App() {
 
   async function handleCreateWorkspace(e: React.FormEvent) {
     e.preventDefault();
-    if (!user || !newOrgNameInput.trim()) return;
+    if (!user || !newOrgNameInput.trim() || !db) return;
 
     setError("");
     setMessage("");
 
     try {
-      const orgRef = doc(collection(db, "organizations"));
+      const orgRef = doc(collection(db!, "organizations"));
       const organizationId = orgRef.id;
 
-      await setDoc(orgRef, {
+      await setDoc(orgRef!, {
         id: organizationId,
         name: newOrgNameInput.trim(),
         createdAt: serverTimestamp(),
@@ -458,7 +489,7 @@ function App() {
         createdByUid: user.uid,
       });
 
-      await setDoc(doc(db, "organizationMembers", `${organizationId}_${user.uid}`), {
+      await setDoc(doc(db!, "organizationMembers", `${organizationId}_${user.uid}`), {
         organizationId,
         userId: user.uid,
         role: "Owner",
@@ -479,9 +510,9 @@ function App() {
   }
 
   async function handleRemoveMember(memberUid: string) {
-    if (!activeOrgId) return;
+    if (!activeOrgId || !db) return;
     try {
-      await deleteDoc(doc(db, "organizationMembers", `${activeOrgId}_${memberUid}`));
+      await deleteDoc(doc(db!, "organizationMembers", `${activeOrgId}_${memberUid}`));
       setMessage("Member removed successfully.");
       await loadOrgMembers(activeOrgId);
     } catch (err: any) {
@@ -491,13 +522,13 @@ function App() {
   }
 
   async function handleLeaveOrganization() {
-    if (!activeOrgId || !user) return;
+    if (!activeOrgId || !user || !db) return;
     if (!window.confirm("Are you sure you want to leave this organization?")) {
       return;
     }
 
     try {
-      await deleteDoc(doc(db, "organizationMembers", `${activeOrgId}_${user.uid}`));
+      await deleteDoc(doc(db!, "organizationMembers", `${activeOrgId}_${user.uid}`));
       setMessage("You have left the organization.");
       
       const updatedOrgs = await loadUserOrgs(user.uid);
@@ -514,7 +545,7 @@ function App() {
   }
 
   async function handleDeleteOrganization() {
-    if (!activeOrgId || !user) return;
+    if (!activeOrgId || !user || !db) return;
     
     const currentOrg = userOrgs.find(o => o.id === activeOrgId);
     const confirmName = window.prompt(
@@ -528,21 +559,21 @@ function App() {
 
     try {
       // 1. Delete all projects in this organization
-      const projectsQuery = query(collection(db, "projects"), where("organizationId", "==", activeOrgId));
+      const projectsQuery = query(collection(db!, "projects"), where("organizationId", "==", activeOrgId));
       const projectsSnap = await getDocs(projectsQuery);
       for (const pDoc of projectsSnap.docs) {
-        await deleteDoc(doc(db, "projects", pDoc.id));
+        await deleteDoc(doc(db!, "projects", pDoc.id));
       }
 
       // 2. Delete all membership records
-      const membersQuery = query(collection(db, "organizationMembers"), where("organizationId", "==", activeOrgId));
+      const membersQuery = query(collection(db!, "organizationMembers"), where("organizationId", "==", activeOrgId));
       const membersSnap = await getDocs(membersQuery);
       for (const mDoc of membersSnap.docs) {
-        await deleteDoc(doc(db, "organizationMembers", mDoc.id));
+        await deleteDoc(doc(db!, "organizationMembers", mDoc.id));
       }
 
       // 3. Delete the organization document
-      await deleteDoc(doc(db, "organizations", activeOrgId));
+      await deleteDoc(doc(db!, "organizations", activeOrgId));
 
       setMessage("Organization and all associated data deleted.");
       
@@ -556,9 +587,9 @@ function App() {
   }
 
   async function handleUpdateMemberRole(memberUid: string, newRole: OrganizationRole) {
-    if (!activeOrgId) return;
+    if (!activeOrgId || !db) return;
     try {
-      await updateDoc(doc(db, "organizationMembers", `${activeOrgId}_${memberUid}`), {
+      await updateDoc(doc(db!, "organizationMembers", `${activeOrgId}_${memberUid}`), {
         role: newRole,
         updatedAt: serverTimestamp(),
       });
@@ -571,14 +602,14 @@ function App() {
   }
 
   async function handleRenameOrganization() {
-    if (!activeOrgId || !user) return;
+    if (!activeOrgId || !user || !db) return;
     const cleanName = orgRenameValue.trim();
     if (!cleanName) {
       setError("Please enter a workspace name.");
       return;
     }
     try {
-      await updateDoc(doc(db, "organizations", activeOrgId), {
+      await updateDoc(doc(db!, "organizations", activeOrgId), {
         name: cleanName,
         updatedAt: serverTimestamp(),
       });
@@ -591,7 +622,7 @@ function App() {
   }
 
   async function handleInviteUser() {
-    if (!activeOrgId || !user) return;
+    if (!activeOrgId || !user || !db) return;
     
     setError("");
     setMessage("");
@@ -603,7 +634,7 @@ function App() {
     }
 
     try {
-      const userQuery = query(collection(db, "users"), where("email", "==", cleanEmail));
+      const userQuery = query(collection(db!, "users"), where("email", "==", cleanEmail));
       const userSnap = await getDocs(userQuery);
       
       if (userSnap.empty) {
@@ -614,13 +645,13 @@ function App() {
       const invitedUid = userSnap.docs[0].id;
 
       // Check if user is already a member
-      const memberCheck = await getDoc(doc(db, "organizationMembers", `${activeOrgId}_${invitedUid}`));
+      const memberCheck = await getDoc(doc(db!, "organizationMembers", `${activeOrgId}_${invitedUid}`));
       if (memberCheck.exists()) {
         setError("This user is already a member of the organization.");
         return;
       }
 
-      await setDoc(doc(db, "organizationMembers", `${activeOrgId}_${invitedUid}`), {
+      await setDoc(doc(db!, "organizationMembers", `${activeOrgId}_${invitedUid}`), {
         organizationId: activeOrgId,
         userId: invitedUid,
         role: inviteRole,
@@ -683,7 +714,7 @@ function App() {
       return;
     }
 
-    if (!activeOrgId) {
+    if (!activeOrgId || !db) {
       setError("No active organization found.");
       return;
     }
@@ -727,7 +758,7 @@ function App() {
         updatedAt: serverTimestamp(),
       };
 
-      const createdRef = await addDoc(collection(db, "projects"), newProject);
+      const createdRef = await addDoc(collection(db!, "projects"), newProject);
 
       const createdProject = {
         id: createdRef.id,
@@ -749,7 +780,7 @@ function App() {
   }
 
   async function handleRealConnectGoogle() {
-    if (!selectedProject) {
+    if (!selectedProject || !functions) {
       setError("No project selected.");
       return;
     }
@@ -758,7 +789,7 @@ function App() {
     setMessage("Starting Google connection...");
 
     try {
-      const startGoogleOAuth = httpsCallable(functions, "startGoogleOAuth");
+      const startGoogleOAuth = httpsCallable(functions!, "startGoogleOAuth");
       const result: any = await startGoogleOAuth({
         projectId: selectedProject.id,
       });
@@ -777,7 +808,7 @@ function App() {
   }
 
   async function handleMockConnectGoogle() {
-    if (!selectedProject) {
+    if (!selectedProject || !db) {
       setError("No project selected.");
       return;
     }
@@ -792,7 +823,7 @@ function App() {
         setupStep: "google_connected",
       };
 
-      await updateDoc(doc(db, "projects", selectedProject.id), {
+      await updateDoc(doc(db!, "projects", selectedProject.id), {
         status: "google_connected",
         setupStep: "google_connected",
         updatedAt: serverTimestamp(),
@@ -850,7 +881,7 @@ function App() {
   }
 
   async function handleRealChooseGoogleSheet() {
-    if (!selectedProject) {
+    if (!selectedProject || !functions) {
       setError("Select a project first.");
       return;
     }
@@ -859,7 +890,7 @@ function App() {
     setMessage("Creating a new Google Sheet for this project...");
 
     try {
-      const runRealSync = httpsCallable(functions, "runRealSync");
+      const runRealSync = httpsCallable(functions!, "runRealSync");
       const result = await runRealSync({
         projectId: selectedProject.id,
       });
@@ -1004,7 +1035,7 @@ function App() {
   }
 
   async function handleMockChooseGoogleSheet() {
-    if (!selectedProject) {
+    if (!selectedProject || !db) {
       setError("No project selected.");
       return;
     }
@@ -1024,7 +1055,7 @@ function App() {
         setupStep: "sheet_connected",
       };
 
-      await updateDoc(doc(db, "projects", selectedProject.id), {
+      await updateDoc(doc(db!, "projects", selectedProject.id), {
         status: "sheet_connected",
         setupStep: "sheet_connected",
         spreadsheetName: `${selectedProject.businessName} - UnScriptly Operations`,
@@ -1092,7 +1123,7 @@ function App() {
           });
         }
 
-        const runRealSync = httpsCallable(functions, "runRealSync");
+        const runRealSync = httpsCallable(functions!, "runRealSync");
         const result = await runRealSync({
           projectId: selectedProject.id,
         });
@@ -1153,7 +1184,7 @@ function App() {
   }
 
   async function handleMockEnableLeadsModule() {
-    if (!selectedProject) {
+    if (!selectedProject || !db) {
       setError("No project selected.");
       return;
     }
@@ -1174,14 +1205,14 @@ function App() {
         setupStage: "choose_template" as SetupStage,
       };
 
-      await updateDoc(doc(db, "projects", selectedProject.id), {
+      await updateDoc(doc(db!, "projects", selectedProject.id), {
         status: "leads_enabled",
         setupStep: "leads_enabled",
         setupStage: "choose_template" as SetupStage,
         updatedAt: serverTimestamp(),
       });
 
-      await setDoc(doc(db, "featureConfigs", `${selectedProject.id}_leads`), {
+      await setDoc(doc(db!, "featureConfigs", `${selectedProject.id}_leads`), {
         projectId: selectedProject.id,
         moduleKey: "leads",
         enabled: true,
@@ -1226,7 +1257,7 @@ function App() {
   }
 
   async function handleSaveLeadsConfiguration() {
-    if (!selectedProject) {
+    if (!selectedProject || !db) {
       setError("No project selected.");
       return;
     }
@@ -1257,7 +1288,7 @@ function App() {
 
     try {
       await setDoc(
-        doc(db, "featureConfigs", `${selectedProject.id}_leads`),
+        doc(db!, "featureConfigs", `${selectedProject.id}_leads`),
         {
           projectId: selectedProject.id,
           moduleKey: "leads",
@@ -1271,7 +1302,7 @@ function App() {
         { merge: true }
       );
 
-      await updateDoc(doc(db, "projects", selectedProject.id), {
+      await updateDoc(doc(db!, "projects", selectedProject.id), {
         status: "leads_configured",
         setupStep: "leads_configured",
         setupStage: "match_data" as SetupStage,
@@ -1310,7 +1341,7 @@ function App() {
   }
 
   async function handleSaveLeadFieldMappings() {
-    if (!selectedProject) {
+    if (!selectedProject || !db) {
       setError("No project selected.");
       return;
     }
@@ -1356,7 +1387,7 @@ function App() {
 
     try {
       await setDoc(
-        doc(db, "mappings", `${selectedProject.id}_leads`),
+        doc(db!, "mappings", `${selectedProject.id}_leads`),
         {
           projectId: selectedProject.id,
           moduleKey: "leads",
@@ -1372,7 +1403,7 @@ function App() {
         { merge: true }
       );
 
-      await updateDoc(doc(db, "projects", selectedProject.id), {
+      await updateDoc(doc(db!, "projects", selectedProject.id), {
         status: "leads_mapped",
         setupStep: "leads_mapped",
         setupStage: "customize_design" as SetupStage,
@@ -1411,7 +1442,7 @@ function App() {
   }
 
   async function handleSaveAddLeadFormPreview() {
-    if (!selectedProject) {
+    if (!selectedProject || !db) {
       setError("No project selected.");
       return;
     }
@@ -1442,7 +1473,7 @@ function App() {
 
     try {
       await setDoc(
-        doc(db, "formConfigs", `${selectedProject.id}_leads_add`),
+        doc(db!, "formConfigs", `${selectedProject.id}_leads_add`),
         {
           projectId: selectedProject.id,
           moduleKey: "leads",
@@ -1470,7 +1501,7 @@ function App() {
         { merge: true }
       );
 
-      await updateDoc(doc(db, "projects", selectedProject.id), {
+      await updateDoc(doc(db!, "projects", selectedProject.id), {
         status: "add_lead_form_previewed",
         setupStep: "add_lead_form_previewed",
         setupStage: "customize_design" as SetupStage,
@@ -1574,7 +1605,7 @@ function App() {
   }
 
   async function handleGenerateAiImplementationPlan() {
-    if (!selectedProject) {
+    if (!selectedProject || !db) {
       setError("No project selected.");
       return;
     }
@@ -1595,7 +1626,7 @@ function App() {
 
     try {
       await setDoc(
-        doc(db, "aiImplementationPlans", `${selectedProject.id}_latest`),
+        doc(db!, "aiImplementationPlans", `${selectedProject.id}_latest`),
         {
           projectId: selectedProject.id,
           planType: "mock_ai_implementation_plan",
@@ -1615,7 +1646,7 @@ function App() {
         { merge: true }
       );
 
-      await updateDoc(doc(db, "projects", selectedProject.id), {
+      await updateDoc(doc(db!, "projects", selectedProject.id), {
         status: "ai_plan_ready",
         setupStep: "ai_plan_ready",
         setupStage: "review_build_plan" as SetupStage,
@@ -1648,7 +1679,7 @@ function App() {
   }
 
   async function handleApproveAiImplementationPlan() {
-    if (!selectedProject) {
+    if (!selectedProject || !db) {
       setError("No project selected.");
       return;
     }
@@ -1663,7 +1694,7 @@ function App() {
 
     try {
       await setDoc(
-        doc(db, "aiImplementationPlans", `${selectedProject.id}_latest`),
+        doc(db!, "aiImplementationPlans", `${selectedProject.id}_latest`),
         {
           projectId: selectedProject.id,
           approved: true,
@@ -1674,7 +1705,7 @@ function App() {
         { merge: true }
       );
 
-      await updateDoc(doc(db, "projects", selectedProject.id), {
+      await updateDoc(doc(db!, "projects", selectedProject.id), {
         status: "sync_ready",
         setupStep: "sync_ready",
         setupStage: "build_app" as SetupStage,
@@ -1775,7 +1806,7 @@ function App() {
   }
 
   async function handleSaveSyncCenterPreview() {
-    if (!selectedProject) {
+    if (!selectedProject || !db) {
       setError("No project selected.");
       return;
     }
@@ -1792,7 +1823,7 @@ function App() {
 
     try {
       await setDoc(
-        doc(db, "syncRuns", `${selectedProject.id}_preview`),
+        doc(db!, "syncRuns", `${selectedProject.id}_preview`),
         {
           projectId: selectedProject.id,
           runType: "pre_sync_preview",
@@ -1809,7 +1840,7 @@ function App() {
         { merge: true }
       );
 
-      await updateDoc(doc(db, "projects", selectedProject.id), {
+      await updateDoc(doc(db!, "projects", selectedProject.id), {
         setupStep: "pre_sync_reviewed",
         setupStage: "build_app" as SetupStage,
         updatedAt: serverTimestamp(),
@@ -2101,7 +2132,7 @@ function getHeaders_(sheet) {
   }
 
   async function handleRunSyncMvp() {
-    if (!selectedProject) {
+    if (!selectedProject || !functions) {
       setError("No project selected.");
       return;
     }
@@ -2110,7 +2141,7 @@ function getHeaders_(sheet) {
     setMessage("Running real Google Sync...");
 
     try {
-      const runRealSync = httpsCallable(functions, "runRealSync");
+      const runRealSync = httpsCallable(functions!, "runRealSync");
       const result: any = await runRealSync({
         projectId: selectedProject.id,
       });
@@ -2143,7 +2174,8 @@ function getHeaders_(sheet) {
   }
 
   async function handleLogout() {
-    await signOut(auth);
+    if (!auth) return;
+    await signOut(auth!);
     setMessage("");
     setError("");
   }
@@ -2167,14 +2199,6 @@ function getHeaders_(sheet) {
       <main className="auth-page">
         <section className="auth-hero">
           <div className="brand-mark">U</div>
-          {error && error.includes("Configuration") && (
-            <div className="error-box" style={{ marginTop: 32, marginBottom: -12, maxWidth: 600 }}>
-              <strong>System Configuration Error</strong>
-              <p style={{ margin: "8px 0 0", fontSize: 13, fontWeight: 400, lineHeight: 1.4 }}>
-                {error}
-              </p>
-            </div>
-          )}
           <p className="eyebrow">UnScriptly</p>
           <h1>Turn your Google Sheet into a private dashboard.</h1>
           <p className="hero-copy">

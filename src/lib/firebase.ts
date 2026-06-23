@@ -5,13 +5,13 @@ import { getFunctions } from "firebase/functions";
 import { getAnalytics, isSupported } from "firebase/analytics";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyCcDxura-YKm4qmYV2z4G-EX8JkGr15C3Q",
-  authDomain: "unscriptly.firebaseapp.com",
-  projectId: "unscriptly",
-  storageBucket: "unscriptly.firebasestorage.app",
-  messagingSenderId: "95655827036",
-  appId: "1:95655827036:web:636f218879ee017823b899",
-  measurementId: "G-HSD466M6YR",
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+  measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID,
 };
 
 export const app = initializeApp(firebaseConfig);
